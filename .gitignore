@@ -1,0 +1,8 @@
+/target/
+/cache/
+/music/
+/config.json
+/.beat-index*
+*.part
+.env
+.env.*

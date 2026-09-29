@@ -5,6 +5,7 @@
 mod api;
 mod banner;
 mod cache;
+mod catalog;
 mod config;
 mod local;
 mod player;
@@ -15,7 +16,8 @@ use config::{Config, StreamFormat};
 use eframe::egui;
 use local::LocalTrack;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -86,6 +88,15 @@ enum Repeat {
     One,
 }
 
+struct CatalogScan {
+    rx: Receiver<catalog::Event>,
+    cancel: Arc<AtomicBool>,
+    mode: catalog::Mode,
+    baseline: bool,
+    albums: usize,
+    added: usize,
+}
+
 struct BeatApp {
     cfg: Config,
     cache: Cache,
@@ -139,6 +150,11 @@ struct BeatApp {
     /// song id -> running download (explicit or for playback).
     downloads: HashMap<String, DlHandle>,
     download_queue: VecDeque<api::Song>,
+    /// Pending songs introduced only by automatic discovery. Disabling the
+    /// option removes these, while explicit requests and active transfers stay.
+    auto_queued: HashSet<String>,
+    catalog_scan: Option<CatalogScan>,
+    next_catalog_check: std::time::Instant,
     current: Option<api::Song>,
     play_queue: Vec<api::Song>,
     play_index: usize,
@@ -224,6 +240,9 @@ impl BeatApp {
             dl_rx,
             downloads: HashMap::new(),
             download_queue: VecDeque::new(),
+            auto_queued: HashSet::new(),
+            catalog_scan: None,
+            next_catalog_check: std::time::Instant::now(),
             current: None,
             play_queue: Vec::new(),
             play_index: 0,
@@ -479,6 +498,8 @@ impl BeatApp {
             || draft.server_url.trim() != self.cfg.server_url
             || draft.user.trim() != self.cfg.user
             || draft.password != self.cfg.password;
+        let disabling_auto = self.cfg.auto_cache_new && !draft.auto_cache_new;
+        let enabling_auto = !self.cfg.auto_cache_new && draft.auto_cache_new;
         let mut next = self.cfg.clone();
         next.server_url = draft.server_url.trim().to_owned();
         next.user = draft.user.trim().to_owned();
@@ -488,6 +509,7 @@ impl BeatApp {
         next.stream_format = draft.stream_format;
         next.bit_rate = draft.bit_rate;
         next.parallel_downloads = draft.parallel_downloads;
+        next.auto_cache_new = draft.auto_cache_new;
         // Persist first: if DPAPI or the filesystem refuses the write, keep
         // the running client, cache and settings consistent with the disk.
         if let Err(err) = next.save() {
@@ -495,6 +517,18 @@ impl BeatApp {
             return;
         }
         self.save_error = None;
+        if source_changed || (disabling_auto && self.catalog_scan.as_ref().is_some_and(|scan| scan.mode == catalog::Mode::Automatic)) {
+            self.cancel_catalog_scan();
+        }
+        if disabling_auto {
+            self.download_queue.retain(|song| !self.auto_queued.contains(&song.id));
+            self.auto_queued.clear();
+        }
+        // Only a changed source or a fresh opt-in needs an immediate pass:
+        // resetting on every settings save would rescan the whole library.
+        if source_changed || enabling_auto {
+            self.next_catalog_check = std::time::Instant::now();
+        }
         if source_changed {
             self.stop_playback();
             self.play_queue.clear();
@@ -545,6 +579,85 @@ impl BeatApp {
         theme::set_mode(ctx, self.dark_mode);
         self.cfg.dark_mode = self.dark_mode;
         self.save();
+    }
+
+    fn cancel_catalog_scan(&mut self) {
+        if let Some(scan) = self.catalog_scan.take() {
+            scan.cancel.store(true, Ordering::Relaxed);
+            // Dropping the receiver releases a worker blocked on the bounded
+            // channel, even if the network request is still finishing.
+        }
+    }
+
+    fn start_catalog_scan(&mut self, mode: catalog::Mode) {
+        if self.catalog_scan.is_some() { return; }
+        let Some(client) = self.require_client() else { return };
+        let (tx, rx) = sync_channel(32);
+        let cancel = Arc::new(AtomicBool::new(false));
+        catalog::spawn(client, self.cache.clone(), mode, tx, cancel.clone());
+        self.catalog_scan = Some(CatalogScan { rx, cancel, mode, baseline: false, albums: 0, added: 0 });
+        self.notice = Some("проверяю библиотеку Navidrome…".into());
+    }
+
+    fn maybe_start_automatic_scan(&mut self) {
+        if self.cfg.auto_cache_new && self.client.is_some() && self.catalog_scan.is_none()
+            && std::time::Instant::now() >= self.next_catalog_check {
+            self.start_catalog_scan(catalog::Mode::Automatic);
+        }
+    }
+
+    fn pump_catalog(&mut self) {
+        let mut events = Vec::new();
+        let mut proposed = 0;
+        while events.len() < 128 && self.download_queue.len() + proposed < catalog::MAX_QUEUED {
+            let Some(scan) = &self.catalog_scan else { break };
+            match scan.rx.try_recv() {
+                Ok(event) => {
+                    let finished = matches!(event, catalog::Event::Finished(_));
+                    if matches!(event, catalog::Event::Song(_)) { proposed += 1; }
+                    events.push(event);
+                    if finished { break; }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    events.push(catalog::Event::Finished(Err("проверка библиотеки неожиданно прервалась".into())));
+                    break;
+                }
+            }
+        }
+        for event in events {
+            match event {
+                catalog::Event::Started { baseline } => {
+                    if let Some(scan) = &mut self.catalog_scan { scan.baseline = baseline; }
+                }
+                catalog::Event::AlbumScanned => {
+                    if let Some(scan) = &mut self.catalog_scan { scan.albums += 1; }
+                }
+                catalog::Event::Song(song) => {
+                    let automatic = self.catalog_scan.as_ref().is_some_and(|scan| scan.mode == catalog::Mode::Automatic);
+                    let added = self.offer_download(song, automatic);
+                    if added {
+                        if let Some(scan) = &mut self.catalog_scan { scan.added += 1; }
+                    }
+                }
+                catalog::Event::Finished(result) => {
+                    if let Some(scan) = self.catalog_scan.take() {
+                        self.next_catalog_check = std::time::Instant::now()
+                            + if result.is_err() { catalog::RETRY_AFTER }
+                                else if scan.mode == catalog::Mode::All && self.cfg.auto_cache_new {
+                                    std::time::Duration::ZERO
+                                } else { catalog::POLL_EVERY };
+                        self.notice = Some(match result {
+                            Ok(()) if scan.baseline => format!(
+                                "запомнено альбомов: {}; новые песни будут скачиваться автоматически", scan.albums),
+                            Ok(()) => format!("проверено альбомов: {}; добавлено в загрузки: {}", scan.albums, scan.added),
+                            Err(err) => format!("проверка библиотеки остановлена после {} альбомов (добавлено: {}): {err}",
+                                scan.albums, scan.added),
+                        });
+                    }
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -696,6 +809,7 @@ impl BeatApp {
         }
         while self.downloads.len() < self.cfg.parallel_downloads {
             let Some(song) = self.download_queue.pop_front() else { break };
+            self.auto_queued.remove(&song.id);
             if self.cache.contains(&song.id) || self.downloads.contains_key(&song.id) { continue; }
             self.spawn_download(song);
         }
@@ -719,22 +833,26 @@ impl BeatApp {
             self.notice = Some(format!("уже в кеше: {}", song.title));
             return;
         }
-        if self.downloads.contains_key(&song.id) || self.download_queue.iter().any(|s| s.id == song.id) {
-            return;
+        if self.offer_download(song, false) {
+            self.notice = Some("добавлено в загрузки".into());
         }
+    }
+
+    fn offer_download(&mut self, song: api::Song, automatic: bool) -> bool {
+        if !automatic { self.auto_queued.remove(&song.id); }
+        if song.id.is_empty() || self.cache.contains(&song.id) || self.downloads.contains_key(&song.id)
+            || self.download_queue.iter().any(|queued| queued.id == song.id) {
+            return false;
+        }
+        if automatic { self.auto_queued.insert(song.id.clone()); }
         self.download_queue.push_back(song);
-        self.notice = Some("добавлено в загрузки".into());
+        true
     }
 
     fn enqueue_album(&mut self, songs: &[api::Song]) {
         let mut added = 0;
         for song in songs {
-            if self.cache.contains(&song.id) || self.downloads.contains_key(&song.id) {
-                continue;
-            }
-            if self.download_queue.iter().any(|s| s.id == song.id) { continue; }
-            self.download_queue.push_back(song.clone());
-            added += 1;
+            if self.offer_download(song.clone(), false) { added += 1; }
         }
         self.notice = Some(if added > 0 { format!("в загрузки добавлено треков: {added}") }
             else { "все треки уже скачаны".into() });
@@ -858,6 +976,7 @@ impl BeatApp {
         } else {
             if let Some(position) = self.download_queue.iter().position(|queued| queued.id == song.id) {
                 self.download_queue.remove(position);
+                self.auto_queued.remove(&song.id);
                 self.download_queue.push_front(song.clone());
                 self.play_state = PlayState::Waiting(song);
                 return;
@@ -1017,10 +1136,14 @@ impl BeatApp {
             self.check_request.is_some(),
             self.ping_request.is_some(),
             self.cover_inflight > 0,
+            self.catalog_scan.is_some(),
         ].into_iter().filter(|running| *running).count();
         let transfers = self.downloads.len() + self.download_queue.len();
         if let Some(delay) = repaint_after(playing, transfers, requests) {
             ctx.request_repaint_after(delay);
+        }
+        if self.cfg.auto_cache_new && self.client.is_some() && self.catalog_scan.is_none() {
+            ctx.request_repaint_after(self.next_catalog_check.saturating_duration_since(std::time::Instant::now()));
         }
     }
 
@@ -1103,8 +1226,10 @@ impl BeatApp {
 impl eframe::App for BeatApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_library();
+        self.pump_catalog();
         self.pump_covers(ctx);
         self.pump_downloads();
+        self.maybe_start_automatic_scan();
         self.update_playback(ctx);
 
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Enter)) {
@@ -1235,6 +1360,24 @@ impl BeatApp {
             }
 
             theme::section_label(ui, "ЗАГРУЗКИ");
+            if ui.add_enabled(self.client.is_some() && self.catalog_scan.is_none(),
+                egui::Button::new("↓ скачать все песни").min_size(egui::vec2(ui.available_width(), 26.0)))
+                .on_hover_text("Найти все треки Navidrome и поставить отсутствующие в очередь")
+                .clicked() {
+                self.start_catalog_scan(catalog::Mode::All);
+            }
+            if let Some(scan) = &self.catalog_scan {
+                let label = if scan.baseline { "запоминаю библиотеку" } else { "проверяю библиотеку" };
+                ui.label(egui::RichText::new(format!("{label}: {} альбомов", scan.albums)).size(10.0).color(theme::warn()));
+                if scan.added > 0 {
+                    ui.label(egui::RichText::new(format!("новых загрузок: {}", scan.added)).size(10.0).color(theme::dim()));
+                }
+                if ui.button("× остановить поиск").on_hover_text("Уже запущенные и добавленные в очередь загрузки продолжатся").clicked() {
+                    self.cancel_catalog_scan();
+                    self.next_catalog_check = std::time::Instant::now() + catalog::POLL_EVERY;
+                    self.notice = Some("поиск остановлен; уже добавленные загрузки продолжаются".into());
+                }
+            }
             let active: Vec<(String, DlHandle)> = self.downloads.iter()
                 .map(|(id, handle)| (id.clone(), handle.clone())).collect();
             if active.is_empty() && self.download_queue.is_empty() {
@@ -1251,6 +1394,17 @@ impl BeatApp {
             }
             if !self.download_queue.is_empty() {
                 theme::kv_row(ui, "в очереди", &format!("{}", self.download_queue.len()), theme::dim());
+                if ui.button("× очистить очередь").on_hover_text("Отменить ожидающие загрузки; уже начатые продолжатся").clicked() {
+                    // Otherwise the still-running catalog worker immediately
+                    // fills the queue again on the next frame.
+                    if self.catalog_scan.is_some() {
+                        self.cancel_catalog_scan();
+                        self.next_catalog_check = std::time::Instant::now() + catalog::POLL_EVERY;
+                    }
+                    self.download_queue.clear();
+                    self.auto_queued.clear();
+                    self.notice = Some("поиск и ожидающие загрузки отменены; начатые продолжаются".into());
+                }
             }
 
             theme::section_label(ui, "КЕШ");
@@ -1882,6 +2036,10 @@ impl BeatApp {
                         ui.label(egui::RichText::new("параллельных загрузок").size(11.0).color(theme::dim()));
                         ui.add(egui::DragValue::new(&mut draft.parallel_downloads).speed(1.0).range(1..=3));
                     });
+                    ui.add_space(6.0);
+                    ui.checkbox(&mut draft.auto_cache_new, "автоматически кешировать новые песни");
+                    ui.label(egui::RichText::new("При первом включении запоминает текущие треки; затем проверяет сервер каждые 10 минут, пока BEAT открыт.")
+                        .size(10.0).color(theme::dim()));
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.add_enabled(!checking, egui::Button::new("[ ПРОВЕРИТЬ СВЯЗЬ ]")).clicked() {

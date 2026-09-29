@@ -146,7 +146,48 @@ impl Client {
     pub fn album_list(&self, kind: &str, size: u32, offset: u32) -> Result<Vec<Album>, String> {
         let v = self.get_json("getAlbumList2.view", &[
             ("type", kind), ("size", &size.to_string()), ("offset", &offset.to_string())])?;
-        Ok(parse_album_list(&v))
+        let Some(list) = v.get("albumList2").and_then(|list| list.as_object()) else {
+            return Err("сервер не прислал список альбомов".into());
+        };
+        if list.get("album").is_some_and(|albums| !albums.is_array()) {
+            return Err("сервер прислал некорректный список альбомов".into());
+        }
+        let albums = parse_album_list(&v);
+        if list.get("album").and_then(|albums| albums.as_array()).is_some_and(|raw| raw.len() != albums.len()) {
+            return Err("сервер прислал альбом без ID или с неверными данными".into());
+        }
+        Ok(albums)
+    }
+
+    /// Strict variant for a full-library scan. The regular album view can
+    /// display a partial reply, but a catalog baseline must not silently
+    /// record it as complete and later treat old songs as newly added.
+    pub fn catalog_album(&self, id: &str) -> Result<Vec<Song>, String> {
+        let v = self.get_json("getAlbum.view", &[("id", id)])?;
+        let Some(album) = v.get("album").and_then(|album| album.as_object()) else {
+            return Err("сервер не прислал альбом для проверки библиотеки".into());
+        };
+        if album.get("id").and_then(|value| value.as_str()) != Some(id) {
+            return Err("сервер прислал другой альбом для проверки библиотеки".into());
+        }
+        if album.get("song").is_some_and(|songs| !songs.is_array()) {
+            return Err("сервер прислал некорректный список песен".into());
+        }
+        let songs = parse_album(&v).1;
+        let declared_count = album.get("songCount").map(|count| {
+            count.as_u64().or_else(|| count.as_str().and_then(|text| text.trim().parse::<u64>().ok()))
+        });
+        if album.get("song").and_then(|songs| songs.as_array()).is_some_and(|raw| raw.len() != songs.len())
+            || declared_count.is_some_and(|count| count != Some(songs.len() as u64)) {
+            return Err("сервер прислал неполный список песен альбома".into());
+        }
+        Ok(songs)
+    }
+
+    /// Separate on-disk catalog checkpoints for each server and user, without
+    /// putting the URL or username in the file name.
+    pub fn catalog_key(&self) -> String {
+        md5_hex(&format!("{}\0{}", self.base, self.user))
     }
 
     pub fn search(&self, query: &str) -> Result<SearchResult, String> {
@@ -647,6 +688,29 @@ mod tests {
         assert!(parse_response(r#"{"other":1}"#).is_err());
         let oversized = serde_json::json!({"subsonic-response": {"status": "failed", "error": {"message": "x".repeat(1000)}}});
         assert!(parse_response(&oversized.to_string()).unwrap_err().chars().count() < 400);
+    }
+
+    #[test]
+    fn catalog_album_refuses_incomplete_or_mismatched_payloads() {
+        // (body, must_fail): a full-library baseline may only be recorded from
+        // a reply that provably lists every song of the album.
+        let scenarios = [
+            (r#"{"subsonic-response":{"status":"ok","album":{"id":"9","songCount":2,"song":[{"id":"a"}]}}}"#, true),
+            (r#"{"subsonic-response":{"status":"ok","album":{"id":"9","song":[{"id":""}]}}}"#, true),
+            (r#"{"subsonic-response":{"status":"ok","album":{"id":"8","song":[{"id":"a"}]}}}"#, true),
+            (r#"{"subsonic-response":{"status":"ok","album":{"id":"9","songCount":"","song":[{"id":"a"}]}}}"#, true),
+            (r#"{"subsonic-response":{"status":"ok","album":{"id":"9","songCount":"2","song":[{"id":"a"},{"id":"b"}]}}}"#, false),
+        ];
+        for (body, must_fail) in scenarios {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}/", listener.local_addr().unwrap());
+            let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let server = serve(listener, 1, move |_| reply.clone());
+            let client = Client::new(&Server { base, user: "u".into(), password: "p".into() }, StreamFormat::Raw, 320).unwrap();
+            let result = client.catalog_album("9");
+            server.join().unwrap();
+            assert_eq!(result.is_err(), must_fail, "{body}");
+        }
     }
 
     #[test]

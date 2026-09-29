@@ -168,6 +168,9 @@ pub struct Config {
     /// Parallel downloads (1..=3).
     #[serde(default = "default_parallel")]
     pub parallel_downloads: usize,
+    /// Detect and cache songs added after the first complete catalog scan.
+    #[serde(default)]
+    pub auto_cache_new: bool,
     #[serde(default = "default_true")]
     pub dark_mode: bool,
     #[serde(default = "default_volume")]
@@ -201,6 +204,7 @@ impl Default for Config {
             stream_format: StreamFormat::Raw,
             bit_rate: 320,
             parallel_downloads: 3,
+            auto_cache_new: false,
             dark_mode: true,
             volume: 0.8,
             unreadable_password: None,
@@ -374,6 +378,9 @@ mod tests {
         let legacy: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(legacy.bit_rate, 320);
         assert!(legacy.dark_mode);
+        assert!(!legacy.auto_cache_new);
+        let enabled: Config = serde_json::from_str(r#"{"auto_cache_new":true}"#).unwrap();
+        assert!(enabled.auto_cache_new);
     }
 
     #[test]

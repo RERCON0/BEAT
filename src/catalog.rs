@@ -1,7 +1,9 @@
-//! Full-library discovery for bulk downloads and automatic caching. The first
-//! automatic pass saves a baseline of existing song IDs; later passes find new
-//! IDs even when they are added to an old album. Songs are sent through a
-//! bounded channel so a large library cannot fill the UI's download queue.
+//! Full-library discovery for the unified library list, bulk downloads and
+//! automatic caching. The first automatic pass saves a baseline of existing
+//! song IDs; later passes find new IDs even when they are added to an old
+//! album. Songs are sent through a bounded channel so a large library cannot
+//! fill the UI's download queue. `Mode::Library` streams the full song list
+//! (metadata only, no queueing) and the UI caches it on disk.
 
 use crate::api::{Client, Song};
 use crate::cache::Cache;
@@ -25,7 +27,14 @@ const MAX_SONGS: usize = 500_000;
 const MAX_STATE_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Automatic, All }
+pub enum Mode {
+    /// Detect songs added since the checkpoint and queue them.
+    Automatic,
+    /// Queue every song that is not on disk yet.
+    All,
+    /// Stream the full server song list for the unified library view.
+    Library,
+}
 
 pub enum Event {
     Started { baseline: bool },
@@ -42,6 +51,12 @@ struct CatalogFile {
 
 pub fn state_path(client: &Client) -> PathBuf {
     config_path().with_file_name(format!("catalog-{}.json", client.catalog_key()))
+}
+
+/// Where the last full server song list is cached, so the unified library
+/// view opens instantly on the next launch.
+pub fn library_path(client: &Client) -> PathBuf {
+    config_path().with_file_name(format!("library-{}.json", client.catalog_key()))
 }
 
 /// Each run uses an independent reader. Dropping that reader and setting
@@ -105,6 +120,10 @@ fn scan(
                 }
                 if baseline {
                     known.insert(song.id);
+                } else if mode == Mode::Library {
+                    // The full list, cached files included: the UI merges and
+                    // de-duplicates against the on-disk index.
+                    send(tx, Event::Song(song), cancel)?;
                 } else if mode == Mode::All {
                     if !cache.contains(&song.id) { send(tx, Event::Song(song), cancel)?; }
                 } else if !known.contains(&song.id) {
@@ -145,27 +164,108 @@ fn send(tx: &SyncSender<Event>, event: Event, cancel: &AtomicBool) -> Result<(),
     tx.send(event).map_err(|_| "проверка библиотеки отменена".to_owned())
 }
 
-fn load_known(path: &Path) -> Result<Option<HashSet<String>>, String> {
+/// Reads a file with a bound checked before anything is loaded; `Ok(None)` is
+/// a missing file, `Err` is anything that exists but cannot be trusted.
+fn read_capped_file(path: &Path, cap: u64, what: &str) -> Result<Option<Vec<u8>>, String> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("не удалось прочитать список известных песен: {err}")),
+        Err(err) => return Err(format!("не удалось прочитать {what}: {err}")),
     };
-    if file.metadata().map_err(|e| e.to_string())?.len() > MAX_STATE_BYTES {
-        return Err("список известных песен слишком большой; файл сохранён без изменений".into());
+    if file.metadata().map_err(|e| e.to_string())?.len() > cap {
+        return Err(format!("{what} слишком большой; файл сохранён без изменений"));
     }
     let mut bytes = Vec::new();
-    file.take(MAX_STATE_BYTES + 1).read_to_end(&mut bytes)
-        .map_err(|e| format!("не удалось прочитать список известных песен: {e}"))?;
-    if bytes.len() as u64 > MAX_STATE_BYTES {
-        return Err("список известных песен слишком большой; файл сохранён без изменений".into());
+    file.take(cap + 1).read_to_end(&mut bytes)
+        .map_err(|e| format!("не удалось прочитать {what}: {e}"))?;
+    if bytes.len() as u64 > cap {
+        return Err(format!("{what} слишком большой; файл сохранён без изменений"));
     }
+    Ok(Some(bytes))
+}
+
+fn load_known(path: &Path) -> Result<Option<HashSet<String>>, String> {
+    let Some(bytes) = read_capped_file(path, MAX_STATE_BYTES, "список известных песен")? else {
+        return Ok(None);
+    };
     let state: CatalogFile = serde_json::from_slice(&bytes)
         .map_err(|_| "список известных песен повреждён; файл сохранён без изменений".to_owned())?;
     if state.version != 1 || state.known.iter().any(String::is_empty) {
         return Err("неподдерживаемый список известных песен; файл сохранён без изменений".into());
     }
     Ok(Some(state.known.into_iter().collect()))
+}
+
+#[derive(Serialize, Deserialize)]
+struct LibraryFile {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    songs: Vec<Song>,
+}
+
+/// Last cached server song list; `Ok(empty)` also covers a missing file, any
+/// broken file is set aside so it is never silently replaced.
+pub fn load_library(client: &Client) -> Result<Vec<Song>, String> {
+    load_library_from(&library_path(client))
+}
+
+pub fn load_library_from(path: &Path) -> Result<Vec<Song>, String> {
+    let bytes = match read_capped_file(path, MAX_STATE_BYTES, "список песен сервера") {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(Vec::new()),
+        Err(err) => {
+            set_aside(path);
+            return Err(err);
+        }
+    };
+    let file: LibraryFile = match serde_json::from_slice(&bytes) {
+        Ok(file) => file,
+        Err(_) => {
+            set_aside(path);
+            return Err("список песен сервера повреждён; старая копия сохранена рядом".into());
+        }
+    };
+    if file.version != 1 {
+        set_aside(path);
+        return Err("неподдерживаемый список песен сервера; старая копия сохранена рядом".into());
+    }
+    Ok(file.songs.into_iter().filter(|song| !song.id.is_empty()).collect())
+}
+
+/// Stores the server song list for the next launch; an oversized list is not
+/// written (the previous copy stays).
+pub fn save_library(client: &Client, songs: &[Song]) -> Result<(), String> {
+    save_library_to(&library_path(client), songs)
+}
+
+pub fn save_library_to(path: &Path, songs: &[Song]) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct Ref<'a> {
+        version: u32,
+        songs: &'a [Song],
+    }
+    let bytes = serde_json::to_vec(&Ref { version: 1, songs })
+        .map_err(|e| format!("не удалось сохранить список песен сервера: {e}"))?;
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        return Err("список песен сервера слишком большой; прежний файл не заменён".into());
+    }
+    let parent = path.parent().ok_or("не удалось определить папку списка песен сервера")?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("не удалось создать папку списка песен сервера: {e}"))?;
+    atomic_write(path, &bytes)
+}
+
+/// Renames a broken file out of the way; a taken name stays as is.
+fn set_aside(path: &Path) {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let backup = path.with_extension(format!("corrupt-{stamp}.bak"));
+    if backup.exists() {
+        return;
+    }
+    let _ = std::fs::rename(path, &backup);
 }
 
 fn save_known(path: &Path, known: &HashSet<String>) -> Result<(), String> {
@@ -393,6 +493,47 @@ mod tests {
         stage.store(0, Ordering::SeqCst);
         assert!(run(&client, &cache, &path, Mode::Automatic).2.is_empty());
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn library_mode_streams_every_song_and_the_cached_list_roundtrips() {
+        let dir = root("library-mode");
+        let path = dir.join("checkpoint.json");
+        let cache = Cache::load(dir.join("cache"));
+        let (client, worker) = mock_server(2, 4, Arc::new(AtomicUsize::new(0)));
+        let (baseline, albums, mut songs) = run(&client, &cache, &path, Mode::Library);
+        assert!(!baseline);
+        assert_eq!(albums, 2);
+        songs.sort();
+        assert_eq!(songs, ["song-album-0", "song-album-1"]);
+        assert!(!path.exists(), "library mode must not touch the auto checkpoint");
+
+        let list: Vec<Song> = ["a", "b"].iter().map(|id| Song {
+            id: format!("song-album-{id}"), title: format!("T {id}"), artist: "A".into(),
+            album: "B".into(), cover_id: "cover-1".into(), duration: 12.5, ..Song::default()
+        }).collect();
+        let store = dir.join("library.json");
+        save_library_to(&store, &list).unwrap();
+        let loaded = load_library_from(&store).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].cover_id, "cover-1");
+        assert_eq!(loaded[0].duration, 12.5);
+        worker.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_corrupt_library_list_is_set_aside_not_silently_replaced() {
+        let dir = root("library-corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.json");
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(load_library_from(&path).is_err());
+        assert!(!path.exists(), "the damaged file was overwritten in place");
+        let backup = std::fs::read_dir(&dir).unwrap().flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains("corrupt"));
+        assert!(backup, "no backup was kept for the damaged library list");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

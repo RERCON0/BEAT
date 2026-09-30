@@ -4,7 +4,7 @@
 
 use crate::config::{Config, StreamFormat};
 use md5::{Digest, Md5};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 const API_VERSION: &str = "1.16.1";
@@ -446,7 +446,7 @@ pub struct Album {
     pub duration: u64,
 }
 
-#[derive(Deserialize, Clone, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct Song {
     #[serde(default)]
     pub id: String,
@@ -456,6 +456,10 @@ pub struct Song {
     pub artist: String,
     #[serde(default)]
     pub album: String,
+    /// Cover id of the song, for the unified library list. `rename` on both
+    /// ser and de keeps the on-disk cache in the Subsonic spelling.
+    #[serde(default, rename = "coverArt")]
+    pub cover_id: String,
     #[serde(default, deserialize_with = "de_u32")]
     pub track: u32,
     #[serde(default, deserialize_with = "de_f64")]

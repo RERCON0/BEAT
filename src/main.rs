@@ -103,6 +103,11 @@ struct BeatApp {
     cache: Cache,
     client: Option<Arc<api::Client>>,
     player: Option<player::Player>,
+    /// Name of the output device the current player was opened on, and when
+    /// it was last checked; a different default device (Bluetooth connected
+    /// or switched off) means the output must be rebuilt.
+    output_device: Option<String>,
+    output_checked_at: std::time::Instant,
     server_status: Option<Result<(), String>>,
     view: View,
     album_list_title: String,
@@ -228,6 +233,7 @@ impl BeatApp {
                 None
             }
         };
+        let output_device = current_output_device_id();
         let (lib_tx, lib_rx) = channel();
         let (cover_tx, cover_rx) = channel();
         let (dl_tx, dl_rx) = channel();
@@ -235,6 +241,8 @@ impl BeatApp {
             dark_mode: cfg.dark_mode,
             client: Self::build_client(&cfg),
             player,
+            output_device,
+            output_checked_at: std::time::Instant::now(),
             server_status: None,
             view: View::Albums,
             album_list_title: "НОВЫЕ АЛЬБОМЫ".into(),
@@ -1143,6 +1151,19 @@ impl BeatApp {
         self.start_song(song);
     }
 
+    /// Plays a song found through the filter or the search box with the whole
+    /// library as its queue: the finder is for finding, and playback keeps
+    /// going in order (or shuffled) once the song ends. A single-song queue
+    /// is used only when the library does not know the song.
+    fn play_from_library(&mut self, song: api::Song) {
+        if let Some(start) = library_queue_start(&self.library_rows, &song.id) {
+            let queue: Vec<api::Song> = self.library_rows.iter().map(LibRow::to_song).collect();
+            self.play_song(song, queue, start);
+        } else {
+            self.play_song(song.clone(), vec![song], 0);
+        }
+    }
+
     /// Rebuilds the shuffle order around the current track; no-op when
     /// shuffle is off or the queue is empty.
     fn refresh_shuffle(&mut self) {
@@ -1453,6 +1474,12 @@ impl BeatApp {
             return;
         };
         if let Some(player) = &self.player {
+            // A seek into a dead stream would hang the UI thread; rebuild the
+            // output instead and keep the track at its position.
+            if player.has_stream_error() {
+                self.rebuild_output("аудиоустройство недоступно");
+                return;
+            }
             if let Err(err) = player.seek(position) {
                 self.play_error = Some(err);
             }
@@ -1472,10 +1499,23 @@ impl BeatApp {
     /// and starts something when nothing is playing at all — after a restart
     /// the library itself is the queue, so plain «play» just works.
     fn toggle_play(&mut self) {
-        let Some(player) = &self.player else {
-            self.play_error = Some("аудиовыход недоступен".into());
-            return;
-        };
+        if self.player.as_ref().is_some_and(|player| player.has_stream_error()) {
+            self.rebuild_output("аудиоустройство было недоступно");
+        }
+        if self.player.is_none() {
+            // A device may have appeared while the output was missing.
+            match player::Player::new(self.cfg.volume) {
+                Ok(fresh) => {
+                    self.player = Some(fresh);
+                    self.output_device = current_output_device_id();
+                }
+                Err(err) => {
+                    self.play_error = Some(err);
+                    return;
+                }
+            }
+        }
+        let Some(player) = &self.player else { return };
         let loaded = !matches!(self.play_state, PlayState::Idle);
         if self.current.is_some() && loaded {
             if player.is_paused() { player.resume(); } else { player.pause(); }
@@ -1499,6 +1539,109 @@ impl BeatApp {
         let queue: Vec<api::Song> = rows.iter().map(LibRow::to_song).collect();
         let first = queue[0].clone();
         self.play_song(first, queue, 0);
+    }
+
+    /// Watches the output: an OS stream error (Bluetooth switched off or out
+    /// of range) or a different default device means the old sink is dead —
+    /// it plays nothing and can hang a seek forever — so the output is
+    /// rebuilt with the same track and position.
+    fn check_output_health(&mut self) {
+        if self.player.as_ref().is_some_and(|player| player.has_stream_error()) {
+            self.rebuild_output("поток аудиоустройства прерван");
+            return;
+        }
+        if self.output_checked_at.elapsed() < std::time::Duration::from_secs(2) {
+            return;
+        }
+        self.output_checked_at = std::time::Instant::now();
+        let current = current_output_device_id();
+        if self.player.is_none() {
+            if current.is_some() {
+                self.rebuild_output("аудиоустройство появилось");
+            } else {
+                self.output_device = current;
+            }
+            return;
+        }
+        if current != self.output_device {
+            self.rebuild_output(if current.is_some() {
+                "аудиоустройство изменилось"
+            } else {
+                "аудиоустройство исчезло"
+            });
+        }
+    }
+
+    /// Replaces the output sink, reloading the current track at the same
+    /// position. A track that was playing keeps playing; a paused or idle
+    /// player stays paused.
+    fn rebuild_output(&mut self, reason: &str) {
+        let position = self.player.as_ref().map(|player| player.position()).unwrap_or(0.0);
+        let was_playing = matches!(self.play_state, PlayState::Playing)
+            && self.player.as_ref().is_some_and(|player| !player.is_paused());
+        let song = self.current.clone();
+        let loaded = !matches!(self.play_state, PlayState::Idle);
+        self.play_state = PlayState::Idle;
+        self.pending_seek = None;
+        match player::Player::new(self.cfg.volume) {
+            Ok(fresh) => self.player = Some(fresh),
+            Err(err) => {
+                self.player = None;
+                self.output_device = current_output_device_id();
+                self.notice = Some(format!("{reason}: {err}"));
+                return;
+            }
+        }
+        self.output_device = current_output_device_id();
+        // Recovery is silent: the user pressed nothing and everything works.
+        // Only a failure to open a new output is worth a message.
+        if let Some(song) = song.filter(|_| loaded) {
+            self.reload_after_output_change(song, position, was_playing);
+        }
+    }
+
+    /// Reopens the current song on the rebuilt output. Files on disk keep
+    /// their position; a stream still downloading restarts from the start.
+    fn reload_after_output_change(&mut self, song: api::Song, position: f64, resume: bool) {
+        let path = if let Some(rel) = song.id.strip_prefix(local::LOCAL_ID_PREFIX) {
+            self.cache.resolve_rel(rel).filter(|path| path.is_file())
+        } else {
+            self.cache.entry(&song.id).map(|entry| self.cache.absolute(&entry))
+        };
+        if let Some(path) = path {
+            let result = self.player.as_ref().map(|player| player.play_file(&path));
+            match result {
+                Some(Ok(())) => {
+                    // Pause before seeking: no audible blip while the position
+                    // is restored, and rodio applies seeks while paused too.
+                    if !resume {
+                        if let Some(player) = &self.player { player.pause(); }
+                    }
+                    if position > 0.5 {
+                        if let Some(player) = &self.player {
+                            if !player.has_stream_error() {
+                                let _ = player.seek(position);
+                            }
+                        }
+                    }
+                    // The same listen continues: do not count it again.
+                    self.counted_current = Some(song.id);
+                    self.play_state = PlayState::Playing;
+                    return;
+                }
+                Some(Err(err)) => {
+                    self.play_error = Some(err);
+                    return;
+                }
+                None => return,
+            }
+        }
+        // Still downloading: the position inside a partial file cannot be
+        // restored reliably after the output was rebuilt. Resume restarts it;
+        // a paused player waits for the next «play» press.
+        if resume {
+            self.start_song(song);
+        }
     }
 
     fn cover_texture(&mut self, cover_id: &str) -> Option<egui::TextureHandle> {
@@ -1569,6 +1712,7 @@ impl BeatApp {
 
 impl eframe::App for BeatApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.check_output_health();
         self.pump_library();
         self.pump_catalog();
         self.pump_covers(ctx);
@@ -1719,10 +1863,13 @@ impl BeatApp {
             }
 
             theme::section_label(ui, "ЗАГРУЗКИ");
-            if ui.add_enabled(self.client.is_some() && self.catalog_scan.is_none(),
-                egui::Button::new("↓ скачать все песни").min_size(egui::vec2(ui.available_width(), 26.0)))
-                .on_hover_text("Найти все треки Navidrome и поставить отсутствующие в очередь")
-                .clicked() {
+            let scan_enabled = self.client.is_some() && self.catalog_scan.is_none();
+            let width = ui.available_width();
+            // `add_sized` centres the whole label, the «↓» included.
+            let scan_clicked = ui.add_enabled_ui(scan_enabled, |ui| {
+                ui.add_sized([width, 26.0], egui::Button::new("↓ скачать все песни"))
+            }).inner.on_hover_text("Найти все треки Navidrome и поставить отсутствующие в очередь").clicked();
+            if scan_clicked {
                 self.start_catalog_scan(catalog::Mode::All);
             }
             if let Some(scan) = &self.catalog_scan {
@@ -1778,8 +1925,14 @@ impl BeatApp {
                 self.open_cache_folder();
             }
             let label = if self.cache_clear_armed { "× точно очистить кеш?" } else { "× очистить кеш" };
-            if ui.add_enabled(self.downloads.is_empty() && self.download_queue.is_empty(),
-                egui::Button::new(label).min_size(egui::vec2(ui.available_width(), 26.0))).clicked() {
+            let clear_enabled = self.downloads.is_empty() && self.download_queue.is_empty();
+            let width = ui.available_width();
+            // `add_sized` (like the button above) centres the whole label,
+            // «×» included; `min_size` would leave it hanging on the left.
+            let clear_clicked = ui.add_enabled_ui(clear_enabled, |ui| {
+                ui.add_sized([width, 26.0], egui::Button::new(label))
+            }).inner.clicked();
+            if clear_clicked {
                 if self.cache_clear_armed {
                     match self.cache.clear() {
                         Ok(()) => self.notice = Some("кеш очищен".into()),
@@ -2317,13 +2470,11 @@ impl BeatApp {
         if let Some(album) = play_album { self.play_album(album); }
         if let Some(album) = download_album { self.download_album(album); }
         if let Some(song) = play_song {
-            self.play_song(song.clone(), vec![song], 0);
+            self.play_from_library(song);
         }
         if let Some(song) = download { self.enqueue_download(song); }
         if let Some(index) = play_local {
-            let song = local[index].to_song();
-            let queue = local.iter().map(DiskEntry::to_song).collect::<Vec<_>>();
-            self.play_song(song, queue, index);
+            self.play_from_library(local[index].to_song());
         }
     }
 
@@ -2494,10 +2645,8 @@ impl BeatApp {
             }
         });
         if let Some(index) = play {
-            // One queue over the whole visible list, so next/prev walk it.
             let song = rows[index].to_song();
-            let play_queue = rows.iter().map(LibRow::to_song).collect::<Vec<_>>();
-            self.play_song(song, play_queue, index);
+            self.play_from_library(song);
         }
         if let Some(id) = remove {
             match self.cache.remove(&id) {
@@ -2943,6 +3092,15 @@ fn field_label(ui: &mut egui::Ui, text: &str) {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Stable id of the current default output device; `None` when there is no
+/// device or the id cannot be read. Used to notice that the OS switched
+/// devices (Bluetooth connected or switched off) while BEAT runs.
+fn current_output_device_id() -> Option<String> {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    let device = rodio::cpal::default_host().default_output_device()?;
+    device.id().ok().map(|id| id.to_string())
+}
+
 fn format_label(format: StreamFormat) -> String {
     match format {
         StreamFormat::Raw => "raw".into(),
@@ -3063,6 +3221,12 @@ fn build_library_rows(disk: &[DiskEntry], server: &[api::Song]) -> Vec<LibRow> {
         (row.artist().to_lowercase(), row.album().to_lowercase(), row.title().to_lowercase())
     });
     rows
+}
+
+/// Position of a song in the full library rows; `None` when the library does
+/// not know it (then it plays alone).
+fn library_queue_start(rows: &[LibRow], song_id: &str) -> Option<usize> {
+    rows.iter().position(|row| row.id() == song_id)
 }
 
 /// What a bare «play» press queues when nothing is playing: the visible
@@ -3804,6 +3968,17 @@ mod tests {
         // Really playing and really paused.
         assert_eq!(transport_play_label(true, true, false), ("▮▮", "пауза"));
         assert_eq!(transport_play_label(true, true, true), ("▶", "продолжить"));
+    }
+
+    #[test]
+    fn a_song_found_by_the_filter_keeps_its_place_in_the_library() {
+        let rows = vec![
+            LibRow::Server(api::Song { id: "a".into(), ..Default::default() }),
+            LibRow::Server(api::Song { id: "b".into(), ..Default::default() }),
+            LibRow::Server(api::Song { id: "c".into(), ..Default::default() }),
+        ];
+        assert_eq!(library_queue_start(&rows, "b"), Some(1), "next must continue in the library");
+        assert_eq!(library_queue_start(&rows, "unknown"), None);
     }
 
     #[test]

@@ -4,7 +4,9 @@
 
 use crate::api::MAX_DURATION_SECS;
 use crate::cache::{GrowingReader, Progress};
-use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player as Output};
+use rodio::cpal::traits::HostTrait;
+use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player as Output};
+use rodio::Decoder;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,15 +22,27 @@ pub struct Player {
     /// thread, which sits inside that reader while the download stalls: the
     /// flag frees it, so the UI thread never waits out the read timeout.
     stream_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    /// Set by the OS when the output stream fails, which is what happens to
+    /// a Bluetooth device that is switched off or carried out of range. A
+    /// dead stream plays nothing and makes `try_seek` block forever, so the
+    /// app rebuilds the output instead of using it.
+    stream_error: Arc<AtomicBool>,
 }
 
 impl Player {
     pub fn new(volume: f32) -> Result<Self, String> {
-        let sink = DeviceSinkBuilder::open_default_sink()
+        let stream_error = Arc::new(AtomicBool::new(false));
+        let sink = open_sink(stream_error.clone())
             .map_err(|e| format!("аудиовыход недоступен: {e}"))?;
         let output = Output::connect_new(sink.mixer());
         output.set_volume(volume);
-        Ok(Self { _sink: sink, output, volume, stream_cancel: Mutex::new(None) })
+        Ok(Self { _sink: sink, output, volume, stream_cancel: Mutex::new(None), stream_error })
+    }
+
+    /// True when the OS reported a failure of the output stream (the device
+    /// disappeared). The caller should rebuild the player.
+    pub fn has_stream_error(&self) -> bool {
+        self.stream_error.load(Ordering::SeqCst)
     }
 
     /// Releases the audio thread from the current stream's reader.
@@ -84,6 +98,11 @@ impl Player {
     }
 
     pub fn seek(&self, seconds: f64) -> Result<(), String> {
+        // `try_seek` on a stream whose device is gone blocks forever, so a
+        // failed stream must never reach it.
+        if self.has_stream_error() {
+            return Err("аудиоустройство недоступно".into());
+        }
         let target = seek_duration(seconds).ok_or_else(|| "некорректная позиция перемотки".to_string())?;
         self.output.try_seek(target)
             .map_err(|e| format!("перемотка недоступна: {e}"))
@@ -95,6 +114,40 @@ impl Player {
     }
 
     pub fn volume(&self) -> f32 { self.volume }
+}
+
+/// Opens the default output device with an error callback that records stream
+/// failures (Bluetooth unplugged, device disabled). Mirrors rodio's own
+/// fallback: the default device first, then any other output device that can
+/// take the configuration.
+fn open_sink(flag: Arc<AtomicBool>) -> Result<MixerDeviceSink, String> {
+    if let Ok(builder) = DeviceSinkBuilder::from_default_device() {
+        if let Ok(sink) = builder.with_error_callback(flag_callback(flag.clone())).open_stream() {
+            return Ok(silence_drop(sink));
+        }
+    }
+    let devices = rodio::cpal::default_host().output_devices().map_err(|e| e.to_string())?;
+    for device in devices {
+        let Ok(builder) = DeviceSinkBuilder::from_device(device) else { continue };
+        if let Ok(sink) = builder.with_error_callback(flag_callback(flag.clone())).open_sink_or_fallback() {
+            return Ok(silence_drop(sink));
+        }
+    }
+    Err("не найдено подходящее устройство вывода".into())
+}
+
+fn flag_callback(flag: Arc<AtomicBool>) -> impl FnMut(rodio::cpal::StreamError) + Send + Clone + 'static {
+    move |err: rodio::cpal::StreamError| {
+        eprintln!("beat: аудиопоток: {err}");
+        flag.store(true, Ordering::SeqCst);
+    }
+}
+
+/// rodio prints a notice when a sink is dropped; rebuilding the output on
+/// every device change would fill the log with it.
+fn silence_drop(mut sink: MixerDeviceSink) -> MixerDeviceSink {
+    sink.log_on_drop(false);
+    sink
 }
 
 /// Where a seek request may really go: never past the end, never past what

@@ -49,14 +49,11 @@ impl Stats {
                 HashMap::new()
             }
         };
-        Self {
-            path,
-            inner: Mutex::new(Inner { counts, dirty: false, saved_at: Instant::now() }),
-        }
+        Self { path, inner: Mutex::new(Inner { counts, dirty: false, saved_at: Instant::now() }) }
     }
 
     pub fn count(&self, id: &str) -> u64 {
-        self.inner.lock().unwrap().counts.get(id).copied().unwrap_or(0)
+        crate::lock(&self.inner).counts.get(id).copied().unwrap_or(0)
     }
 
     /// Counts one listen; writes to disk at most once per `SAVE_EVERY`.
@@ -64,7 +61,7 @@ impl Stats {
         if id.is_empty() {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = crate::lock(&self.inner);
         let count = inner.counts.entry(id.to_owned()).or_insert(0);
         *count = count.saturating_add(1);
         inner.dirty = true;
@@ -75,7 +72,7 @@ impl Stats {
 
     /// Writes pending counts (frequent view open, app exit).
     pub fn flush(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = crate::lock(&self.inner);
         if inner.dirty {
             let _ = save(&self.path, &mut inner);
         }
@@ -106,7 +103,9 @@ fn read_counts(path: &Path) -> Result<HashMap<String, u64>, ()> {
     if parsed.version != 1 {
         return Err(());
     }
-    Ok(parsed.counts.into_iter()
+    Ok(parsed
+        .counts
+        .into_iter()
         .filter(|(id, count)| !id.is_empty() && *count > 0)
         .map(|(id, count)| (id, count.min(u32::MAX as u64)))
         .collect())
@@ -115,14 +114,13 @@ fn read_counts(path: &Path) -> Result<HashMap<String, u64>, ()> {
 fn save(path: &Path, inner: &mut Inner) -> Result<(), String> {
     // Bound the file: the least played entries fall off first.
     if inner.counts.len() > MAX_ENTRIES {
-        let mut entries: Vec<(String, u64)> = inner.counts.iter()
-            .map(|(id, count)| (id.clone(), *count)).collect();
+        let mut entries: Vec<(String, u64)> = inner.counts.iter().map(|(id, count)| (id.clone(), *count)).collect();
         entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         entries.truncate(MAX_ENTRIES);
         inner.counts = entries.into_iter().collect();
     }
-    let bytes = serde_json::to_vec(&StatsFile { version: 1, counts: inner.counts.clone() })
-        .map_err(|e| e.to_string())?;
+    let bytes =
+        serde_json::to_vec(&StatsFile { version: 1, counts: inner.counts.clone() }).map_err(|e| e.to_string())?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -135,10 +133,7 @@ fn save(path: &Path, inner: &mut Inner) -> Result<(), String> {
 /// Renames an unreadable counter file out of the way; a taken name is kept as
 /// is (the save path then starts from a fresh in-memory map anyway).
 fn set_aside(path: &Path) {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let backup = path.with_extension(format!("corrupt-{stamp}.bak"));
     if backup.exists() {
         return;
@@ -151,8 +146,11 @@ mod tests {
     use super::*;
 
     fn test_path(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("beat-stats-{tag}-{}-{}/play-stats.json", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()))
+        std::env::temp_dir().join(format!(
+            "beat-stats-{tag}-{}-{}/play-stats.json",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ))
     }
 
     #[test]
@@ -179,7 +177,8 @@ mod tests {
         let stats = Stats::load_from(path.clone());
         assert_eq!(stats.count("a"), 0);
         assert!(!path.exists(), "the damaged file was overwritten in place");
-        let backup = std::fs::read_dir(path.parent().unwrap()).unwrap()
+        let backup = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
             .flatten()
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .any(|name| name.contains("corrupt"));

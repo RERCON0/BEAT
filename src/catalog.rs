@@ -61,15 +61,11 @@ pub fn library_path(client: &Client) -> PathBuf {
 
 /// Each run uses an independent reader. Dropping that reader and setting
 /// `cancel` prevents an old server's results from entering a new queue.
-pub fn spawn(
-    client: Arc<Client>, cache: Cache, mode: Mode,
-    tx: SyncSender<Event>, cancel: Arc<AtomicBool>,
-) {
+pub fn spawn(client: Arc<Client>, cache: Cache, mode: Mode, tx: SyncSender<Event>, cancel: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         let path = state_path(&client);
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
-            scan(&client, &cache, mode, &path, &tx, &cancel)
-        ));
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan(&client, &cache, mode, &path, &tx, &cancel)));
         let result = outcome.unwrap_or_else(|_| Err("внутренняя ошибка при проверке библиотеки".into()));
         if !cancel.load(Ordering::Relaxed) {
             let _ = tx.send(Event::Finished(result));
@@ -78,8 +74,12 @@ pub fn spawn(
 }
 
 fn scan(
-    client: &Client, cache: &Cache, mode: Mode, path: &Path,
-    tx: &SyncSender<Event>, cancel: &AtomicBool,
+    client: &Client,
+    cache: &Cache,
+    mode: Mode,
+    path: &Path,
+    tx: &SyncSender<Event>,
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
     let (mut known, baseline) = if mode == Mode::Automatic {
         match load_known(path)? {
@@ -106,7 +106,10 @@ fn scan(
         for album in page {
             check_cancel(cancel)?;
             if !seen_albums.insert(album.id.clone()) {
-                return Err("список альбомов изменился во время обхода или сервер повторяет страницу; повторите проверку".into());
+                return Err(
+                    "список альбомов изменился во время обхода или сервер повторяет страницу; повторите проверку"
+                        .into(),
+                );
             }
             if seen_albums.len() > MAX_ALBUMS {
                 return Err("слишком много альбомов: полный обход прерван, список не обрезан молча".into());
@@ -114,7 +117,9 @@ fn scan(
             let songs = client.catalog_album(&album.id)?;
             for song in songs {
                 check_cancel(cancel)?;
-                if !seen_songs.insert(song.id.clone()) { continue; }
+                if !seen_songs.insert(song.id.clone()) {
+                    continue;
+                }
                 if seen_songs.len() > MAX_SONGS {
                     return Err("слишком много песен: полный обход прерван, список не обрезан молча".into());
                 }
@@ -125,7 +130,9 @@ fn scan(
                     // de-duplicates against the on-disk index.
                     send(tx, Event::Song(song), cancel)?;
                 } else if mode == Mode::All {
-                    if !cache.contains(&song.id) { send(tx, Event::Song(song), cancel)?; }
+                    if !cache.contains(&song.id) {
+                        send(tx, Event::Song(song), cancel)?;
+                    }
                 } else if !known.contains(&song.id) {
                     if cache.contains(&song.id) {
                         // Also remember files downloaded manually: deleting
@@ -138,7 +145,9 @@ fn scan(
             }
             send(tx, Event::AlbumScanned, cancel)?;
         }
-        if page_len == 0 { break; }
+        if page_len == 0 {
+            break;
+        }
         // A server may cap responses below `size`; the next offset must be
         // based on what was actually received, not on what was requested.
         offset = offset.checked_add(page_len as u32).ok_or("слишком много альбомов для постраничного обхода")?;
@@ -155,8 +164,11 @@ fn scan(
 }
 
 fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
-    if cancel.load(Ordering::Relaxed) { Err("проверка библиотеки отменена".into()) }
-    else { Ok(()) }
+    if cancel.load(Ordering::Relaxed) {
+        Err("проверка библиотеки отменена".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn send(tx: &SyncSender<Event>, event: Event, cancel: &AtomicBool) -> Result<(), String> {
@@ -176,8 +188,7 @@ fn read_capped_file(path: &Path, cap: u64, what: &str) -> Result<Option<Vec<u8>>
         return Err(format!("{what} слишком большой; файл сохранён без изменений"));
     }
     let mut bytes = Vec::new();
-    file.take(cap + 1).read_to_end(&mut bytes)
-        .map_err(|e| format!("не удалось прочитать {what}: {e}"))?;
+    file.take(cap + 1).read_to_end(&mut bytes).map_err(|e| format!("не удалось прочитать {what}: {e}"))?;
     if bytes.len() as u64 > cap {
         return Err(format!("{what} слишком большой; файл сохранён без изменений"));
     }
@@ -257,10 +268,7 @@ pub fn save_library_to(path: &Path, songs: &[Song]) -> Result<(), String> {
 
 /// Renames a broken file out of the way; a taken name stays as is.
 fn set_aside(path: &Path) {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let backup = path.with_extension(format!("corrupt-{stamp}.bak"));
     if backup.exists() {
         return;
@@ -290,15 +298,24 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     fn root(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("beat-catalog-{tag}-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()))
+        std::env::temp_dir().join(format!(
+            "beat-catalog-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ))
     }
 
-    fn mock_server(album_count: usize, requests: usize, stage: Arc<AtomicUsize>)
-        -> (Client, std::thread::JoinHandle<()>) {
+    fn mock_server(
+        album_count: usize,
+        requests: usize,
+        stage: Arc<AtomicUsize>,
+    ) -> (Client, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let server = Server { base: format!("http://{}", listener.local_addr().unwrap()),
-            user: "test".into(), password: "password".into() };
+        let server = Server {
+            base: format!("http://{}", listener.local_addr().unwrap()),
+            user: "test".into(),
+            password: "password".into(),
+        };
         let client = Client::new(&server, StreamFormat::Raw, 320).unwrap();
         let worker = std::thread::spawn(move || {
             for _ in 0..requests {
@@ -310,7 +327,9 @@ mod tests {
                     let n = socket.read(&mut buf).unwrap();
                     assert!(n > 0);
                     request.extend_from_slice(&buf[..n]);
-                    if request.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
                 }
                 let line = String::from_utf8_lossy(&request);
                 let target = line.split_whitespace().nth(1).unwrap();
@@ -390,8 +409,13 @@ mod tests {
         let cached = dir.join("cache").join("new.mp3");
         std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
         std::fs::write(&cached, b"audio").unwrap();
-        cache.insert(crate::cache::CachedTrack { id: "new-in-old-album".into(), path: "new.mp3".into(),
-            ..Default::default() }).unwrap();
+        cache
+            .insert(crate::cache::CachedTrack {
+                id: "new-in-old-album".into(),
+                path: "new.mp3".into(),
+                ..Default::default()
+            })
+            .unwrap();
         assert!(run(&client, &cache, &path, Mode::Automatic).2.is_empty());
         cache.remove("new-in-old-album").unwrap();
         // Once successfully downloaded and checkpointed, deleting the file
@@ -508,10 +532,18 @@ mod tests {
         assert_eq!(songs, ["song-album-0", "song-album-1"]);
         assert!(!path.exists(), "library mode must not touch the auto checkpoint");
 
-        let list: Vec<Song> = ["a", "b"].iter().map(|id| Song {
-            id: format!("song-album-{id}"), title: format!("T {id}"), artist: "A".into(),
-            album: "B".into(), cover_id: "cover-1".into(), duration: 12.5, ..Song::default()
-        }).collect();
+        let list: Vec<Song> = ["a", "b"]
+            .iter()
+            .map(|id| Song {
+                id: format!("song-album-{id}"),
+                title: format!("T {id}"),
+                artist: "A".into(),
+                album: "B".into(),
+                cover_id: "cover-1".into(),
+                duration: 12.5,
+                ..Song::default()
+            })
+            .collect();
         let store = dir.join("library.json");
         save_library_to(&store, &list).unwrap();
         let loaded = load_library_from(&store).unwrap();
@@ -530,7 +562,9 @@ mod tests {
         std::fs::write(&path, b"not json").unwrap();
         assert!(load_library_from(&path).is_err());
         assert!(!path.exists(), "the damaged file was overwritten in place");
-        let backup = std::fs::read_dir(&dir).unwrap().flatten()
+        let backup = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
             .any(|entry| entry.file_name().to_string_lossy().contains("corrupt"));
         assert!(backup, "no backup was kept for the damaged library list");
         let _ = std::fs::remove_dir_all(dir);
@@ -540,8 +574,12 @@ mod tests {
     fn dropping_a_full_scan_channel_releases_the_worker() {
         let dir = root("cancel-channel");
         let cache = Cache::load(dir.join("cache"));
-        let client = Client::new(&Server { base: "http://127.0.0.1:1".into(),
-            user: "test".into(), password: "password".into() }, StreamFormat::Raw, 320).unwrap();
+        let client = Client::new(
+            &Server { base: "http://127.0.0.1:1".into(), user: "test".into(), password: "password".into() },
+            StreamFormat::Raw,
+            320,
+        )
+        .unwrap();
         let (tx, rx) = std::sync::mpsc::sync_channel(0);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let path = dir.join("checkpoint.json");

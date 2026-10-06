@@ -24,6 +24,16 @@ const SEEK_MARGIN: f32 = 0.02;
 /// A track bigger than this is not a track: a broken or hostile server must
 /// not be able to fill the disk.
 const MAX_TRACK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Windows resolves a path through `MAX_PATH` (260 UTF-16 units) unless the
+/// process is `longPathAware`, and BEAT ships no such manifest. The absolute
+/// path is therefore kept under this, whatever the tags say.
+const MAX_ABSOLUTE_PATH: usize = 240;
+/// Longest single path component. NTFS allows 255; the rest is room for the
+/// ` (2)` collision suffix and the `.part` file.
+const MAX_COMPONENT: usize = 200;
+/// Room inside `MAX_ABSOLUTE_PATH` for the parts that are added after the
+/// relative path is built: two separators, ` (999)` and `.part`.
+const PATH_HEADROOM: usize = 12;
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct CachedTrack {
@@ -52,6 +62,21 @@ struct IndexFile {
     tracks: HashMap<String, CachedTrack>,
 }
 
+/// Borrowed view of the index, so saving never copies every entry.
+#[derive(Serialize)]
+struct IndexFileRef<'a> {
+    version: u32,
+    tracks: &'a HashMap<String, CachedTrack>,
+}
+
+/// Track count and total bytes, kept next to the index so the sidebar does not
+/// sum the whole index on every frame.
+#[derive(Clone, Copy, Default)]
+struct CacheStats {
+    count: usize,
+    bytes: u64,
+}
+
 #[derive(Clone)]
 pub struct Cache {
     inner: Arc<Inner>,
@@ -67,6 +92,8 @@ struct Inner {
     save_lock: Mutex<()>,
     /// Longest file a download may write.
     max_track_bytes: AtomicU64,
+    /// Cached `stats()`. Recomputed from the index after every change to it.
+    stats: Mutex<CacheStats>,
     /// Why the index started empty (unreadable/oversized file), for the UI.
     warning: Option<String>,
     /// The unreadable index could not be set aside: never overwrite it.
@@ -82,29 +109,38 @@ struct LoadedIndex {
 
 impl Cache {
     pub fn load(root: PathBuf) -> Cache {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let stamp =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
         let loaded = load_index(&root, stamp);
         Self::from_loaded(root, loaded)
     }
 
     fn from_loaded(root: PathBuf, loaded: LoadedIndex) -> Cache {
-        Cache { inner: Arc::new(Inner {
-            root,
-            index: Mutex::new(loaded.tracks),
-            reserved: Mutex::new(HashSet::new()),
-            save_lock: Mutex::new(()),
-            max_track_bytes: AtomicU64::new(MAX_TRACK_BYTES),
-            warning: loaded.warning,
-            save_blocked: loaded.save_blocked,
-        }) }
+        let cache = Cache {
+            inner: Arc::new(Inner {
+                root,
+                index: Mutex::new(loaded.tracks),
+                reserved: Mutex::new(HashSet::new()),
+                save_lock: Mutex::new(()),
+                max_track_bytes: AtomicU64::new(MAX_TRACK_BYTES),
+                stats: Mutex::new(CacheStats::default()),
+                warning: loaded.warning,
+                save_blocked: loaded.save_blocked,
+            }),
+        };
+        cache.refresh_stats();
+        cache
     }
 
     /// The cache to use for `root` after a settings change: this very instance
     /// when the folder did not change (downloads still running write through
     /// it, and two instances over one folder overwrite each other's index).
     pub fn for_root(&self, root: PathBuf) -> Cache {
-        if root == self.inner.root { self.clone() } else { Cache::load(root) }
+        if root == self.inner.root {
+            self.clone()
+        } else {
+            Cache::load(root)
+        }
     }
 
     #[cfg(test)]
@@ -122,7 +158,7 @@ impl Cache {
     }
 
     pub fn entry(&self, id: &str) -> Option<CachedTrack> {
-        let entry = self.inner.index.lock().unwrap().get(id).cloned()?;
+        let entry = crate::lock(&self.inner.index).get(id).cloned()?;
         self.resolve_rel(&entry.path)?.is_file().then_some(entry)
     }
 
@@ -134,24 +170,21 @@ impl Cache {
     /// For code that runs every frame: `entry` touches the disk, and a stale
     /// entry is dropped by the next scan or refresh anyway.
     pub fn indexed_entry(&self, id: &str) -> Option<CachedTrack> {
-        self.inner.index.lock().unwrap().get(id).cloned()
+        crate::lock(&self.inner.index).get(id).cloned()
     }
 
     pub fn is_indexed(&self, id: &str) -> bool {
         self.indexed_entry(id).is_some()
     }
 
-    pub fn absolute(&self, entry: &CachedTrack) -> PathBuf {
-        self.absolute_rel(&entry.path)
+    /// Absolute path of an indexed entry, validated exactly like every other
+    /// lookup: inside the cache folder and free of links. `None` when the entry
+    /// is not usable, so a caller cannot accidentally join an unchecked path.
+    pub fn absolute(&self, entry: &CachedTrack) -> Option<PathBuf> {
+        self.resolve_rel(&entry.path)
     }
 
-    /// Resolves a `/`-separated relative path against the cache root; local
-    /// file ids carry their path this way.
-    pub fn absolute_rel(&self, rel: &str) -> PathBuf {
-        rel.split('/').fold(self.inner.root.clone(), |path, part| path.join(part))
-    }
-
-    /// `absolute_rel` for a path that came from outside (a `local:` id, a
+    /// `absolute` for a path that came from outside (a `local:` id, a
     /// cover key): `None` unless it stays inside the cache folder.
     pub fn resolve_rel(&self, rel: &str) -> Option<PathBuf> {
         safe_path(&self.inner.root, rel)
@@ -162,11 +195,10 @@ impl Cache {
     /// the final path and the `.part` path. The path stays reserved until
     /// `release` is called with it.
     pub fn dest_for(&self, song: &Song, suffix: &str) -> Result<(PathBuf, PathBuf), String> {
-        let index = self.inner.index.lock().unwrap();
-        let mut reserved = self.inner.reserved.lock().unwrap();
+        let index = crate::lock(&self.inner.index);
+        let mut reserved = crate::lock(&self.inner.reserved);
         if let Some(entry) = index.get(&song.id) {
-            let path = self.resolve_rel(&entry.path)
-                .ok_or("путь трека в индексе кеша небезопасен")?;
+            let path = self.resolve_rel(&entry.path).ok_or("путь трека в индексе кеша небезопасен")?;
             if path.exists() {
                 return Err("трек уже находится в кеше".into());
             }
@@ -177,7 +209,7 @@ impl Cache {
             let part = part_path(&path);
             return Ok((path, part));
         }
-        let rel: String = relative_path(song, suffix).to_string_lossy().replace('\\', "/");
+        let rel: String = relative_path(song, suffix, self.path_budget()).to_string_lossy().replace('\\', "/");
         let mut candidate = rel.clone();
         let mut counter = 1;
         while reserved.contains(&candidate.to_lowercase())
@@ -188,19 +220,24 @@ impl Cache {
             counter += 1;
             candidate = numbered_path(&rel, counter);
         }
-        let path = self.resolve_rel(&candidate)
-            .ok_or("папка назначения кеша содержит ссылку или небезопасный путь")?;
+        let path = self.resolve_rel(&candidate).ok_or("папка назначения кеша содержит ссылку или небезопасный путь")?;
         reserved.insert(candidate.to_lowercase());
         let part = part_path(&path);
         Ok((path, part))
     }
 
-    /// Gives back a path claimed by `dest_for` once its download ended
+    /// How many UTF-16 units the relative part of a cache path may use: whatever
+    /// is left of `MAX_ABSOLUTE_PATH` once the cache root is paid for.
+    fn path_budget(&self) -> usize {
+        MAX_ABSOLUTE_PATH.saturating_sub(utf16_len(&self.inner.root.to_string_lossy()))
+    }
+
+    /// Releases a path claimed by `dest_for` once its download ended
     /// (finished or failed).
     pub fn release(&self, path: &Path) {
         if let Ok(rel) = path.strip_prefix(&self.inner.root) {
             let key = rel.to_string_lossy().replace('\\', "/").to_lowercase();
-            self.inner.reserved.lock().unwrap().remove(&key);
+            crate::lock(&self.inner.reserved).remove(&key);
         }
     }
 
@@ -210,15 +247,17 @@ impl Cache {
             return Err("путь трека выходит за пределы папки кеша".into());
         }
         {
-            let mut index = self.inner.index.lock().unwrap();
+            let mut index = crate::lock(&self.inner.index);
             index.insert(entry.id.clone(), entry);
         }
+        self.refresh_stats();
         self.save_index()
     }
 
     /// Deletes an indexed file; one that is already gone counts as deleted.
     fn delete_file(&self, entry: &CachedTrack) -> std::io::Result<()> {
-        let path = self.resolve_rel(&entry.path)
+        let path = self
+            .resolve_rel(&entry.path)
             .ok_or_else(|| std::io::Error::other("путь файла содержит ссылку или выходит за пределы кеша"))?;
         match std::fs::remove_file(path) {
             Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
@@ -230,15 +269,17 @@ impl Cache {
     /// stays in the index, so the list never claims it is gone.
     pub fn remove(&self, id: &str) -> Result<(), String> {
         let entry = {
-            let mut index = self.inner.index.lock().unwrap();
+            let mut index = crate::lock(&self.inner.index);
             index.remove(id)
         };
         if let Some(entry) = entry {
             if let Err(err) = self.delete_file(&entry) {
-                self.inner.index.lock().unwrap().insert(entry.id.clone(), entry);
+                crate::lock(&self.inner.index).insert(entry.id.clone(), entry);
+                self.refresh_stats();
                 return Err(format!("не удалось удалить файл: {err}"));
             }
         }
+        self.refresh_stats();
         self.save_index()
     }
 
@@ -246,20 +287,24 @@ impl Cache {
     /// stay indexed and are reported.
     pub fn clear(&self) -> Result<(), String> {
         let entries: Vec<CachedTrack> = {
-            let mut index = self.inner.index.lock().unwrap();
+            let mut index = crate::lock(&self.inner.index);
             index.drain().map(|(_, entry)| entry).collect()
         };
-        let stuck: Vec<CachedTrack> = entries.into_iter()
-            .filter(|entry| self.delete_file(entry).is_err()).collect();
+        let stuck: Vec<CachedTrack> = entries.into_iter().filter(|entry| self.delete_file(entry).is_err()).collect();
         let count = stuck.len();
         {
-            let mut index = self.inner.index.lock().unwrap();
+            let mut index = crate::lock(&self.inner.index);
             for entry in stuck {
                 index.insert(entry.id.clone(), entry);
             }
         }
+        self.refresh_stats();
         self.save_index()?;
-        if count == 0 { Ok(()) } else { Err(format!("не удалось удалить файлов: {count}")) }
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(format!("не удалось удалить файлов: {count}"))
+        }
     }
 
     /// Drops index entries whose file disappeared (manual cleanup in Explorer).
@@ -271,37 +316,60 @@ impl Cache {
         }
         // The disk is checked outside the lock: with thousands of entries (or
         // a slow synced folder) that is a lot of syscalls.
-        let snapshot: Vec<(String, String)> = self.inner.index.lock().unwrap()
-            .values().map(|entry| (entry.id.clone(), entry.path.clone())).collect();
-        let gone: Vec<(String, String)> = snapshot.into_iter()
-            .filter(|(_, path)| self.resolve_rel(path).is_none_or(|path| !path.is_file())).collect();
+        let snapshot: Vec<(String, String)> =
+            crate::lock(&self.inner.index).values().map(|entry| (entry.id.clone(), entry.path.clone())).collect();
+        let gone: Vec<(String, String)> = snapshot
+            .into_iter()
+            .filter(|(_, path)| self.resolve_rel(path).is_none_or(|path| !path.is_file()))
+            .collect();
         let removed = {
-            let mut index = self.inner.index.lock().unwrap();
+            let mut index = crate::lock(&self.inner.index);
             // Only entries still describing the same file: a download may have
             // replaced one meanwhile.
-            gone.iter().filter(|(id, path)| {
-                index.get(id).is_some_and(|entry| &entry.path == path) && index.remove(id).is_some()
-            }).count()
+            gone.iter()
+                .filter(|(id, path)| {
+                    index.get(id).is_some_and(|entry| &entry.path == path) && index.remove(id).is_some()
+                })
+                .count()
         };
         if removed > 0 {
+            self.refresh_stats();
             let _ = self.save_index();
         }
         removed
     }
 
     pub fn stats(&self) -> (usize, u64) {
-        let index = self.inner.index.lock().unwrap();
-        (index.len(), index.values().map(|entry| entry.size).sum())
+        let stats = *crate::lock(&self.inner.stats);
+        (stats.count, stats.bytes)
+    }
+
+    /// Recomputes `stats()` from the index. Called after every change to it, so
+    /// the per-frame sidebar reads never walk the index or block the download
+    /// threads that write to it.
+    fn refresh_stats(&self) {
+        let index = crate::lock(&self.inner.index);
+        let stats = CacheStats { count: index.len(), bytes: index.values().map(|entry| entry.size).sum() };
+        *crate::lock(&self.inner.stats) = stats;
+    }
+
+    /// Relative `/`-separated paths of every indexed download, for the folder
+    /// scan that must skip them. Cheaper than `list`: no entry copy, no sort
+    /// and no disk checks.
+    pub fn indexed_rel_paths(&self) -> HashSet<String> {
+        crate::lock(&self.inner.index).values().map(|entry| entry.path.clone()).collect()
     }
 
     /// All indexed entries whose file still exists, artist/album/track sorted.
     pub fn list(&self) -> Vec<CachedTrack> {
-        let all: Vec<CachedTrack> = self.inner.index.lock().unwrap().values().cloned().collect();
-        let mut entries: Vec<CachedTrack> = all.into_iter()
-            .filter(|entry| self.resolve_rel(&entry.path).is_some_and(|path| path.is_file())).collect();
-        entries.sort_by(|a, b| a.artist.to_lowercase().cmp(&b.artist.to_lowercase())
-            .then_with(|| a.album.to_lowercase().cmp(&b.album.to_lowercase()))
-            .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase())));
+        let all: Vec<CachedTrack> = crate::lock(&self.inner.index).values().cloned().collect();
+        let mut entries: Vec<CachedTrack> =
+            all.into_iter().filter(|entry| self.resolve_rel(&entry.path).is_some_and(|path| path.is_file())).collect();
+        // `sort_by_cached_key` lowercases once per row; doing it inside the
+        // comparator allocates O(n log n) strings for a large cache.
+        entries.sort_by_cached_key(|entry| {
+            (entry.artist.to_lowercase(), entry.album.to_lowercase(), entry.title.to_lowercase())
+        });
         entries
     }
 
@@ -313,17 +381,18 @@ impl Cache {
         // writer lock: an older snapshot never lands after a newer one, and the
         // index lock is free while the file is written (the UI reads the index
         // every frame and must not wait for an fsync).
-        let _writer = self.inner.save_lock.lock().unwrap();
-        let file = {
-            let index = self.inner.index.lock().unwrap();
-            IndexFile { version: 1, tracks: index.clone() }
+        let _writer = crate::lock(&self.inner.save_lock);
+        // Serialized straight from the index under its lock: copying every
+        // entry first doubled the work and the memory for no benefit. The lock
+        // is released before the write below, which is the slow part.
+        let raw = {
+            let index = crate::lock(&self.inner.index);
+            serde_json::to_vec(&IndexFileRef { version: 1, tracks: &index }).map_err(|e| e.to_string())?
         };
-        let raw = serde_json::to_vec(&file).map_err(|e| e.to_string())?;
         if raw.len() as u64 > MAX_INDEX_BYTES {
             return Err("индекс кеша слишком большой".into());
         }
-        std::fs::create_dir_all(&self.inner.root)
-            .map_err(|e| format!("не удалось создать кеш: {e}"))?;
+        std::fs::create_dir_all(&self.inner.root).map_err(|e| format!("не удалось создать кеш: {e}"))?;
         atomic_write(&self.inner.root.join(INDEX_FILE), &raw)
     }
 }
@@ -342,11 +411,14 @@ fn load_index(root: &Path, stamp: u128) -> LoadedIndex {
     match parsed {
         Ok(file) => {
             let total = file.tracks.len();
-            let tracks: HashMap<String, CachedTrack> = file.tracks.into_iter()
-                .filter(|(id, entry)| id == &entry.id && safe_path(root, &entry.path).is_some()).collect();
+            let tracks: HashMap<String, CachedTrack> = file
+                .tracks
+                .into_iter()
+                .filter(|(id, entry)| id == &entry.id && safe_path(root, &entry.path).is_some())
+                .collect();
             let dropped = total - tracks.len();
-            let warning = (dropped > 0)
-                .then(|| format!("в индексе кеша пропущено записей с небезопасным путём: {dropped}"));
+            let warning =
+                (dropped > 0).then(|| format!("в индексе кеша пропущено записей с небезопасным путём: {dropped}"));
             LoadedIndex { tracks, warning, save_blocked: false }
         }
         Err(_) => match set_aside(&path, stamp) {
@@ -357,7 +429,9 @@ fn load_index(root: &Path, stamp: u128) -> LoadedIndex {
             },
             None => LoadedIndex {
                 tracks: HashMap::new(),
-                warning: Some("индекс кеша повреждён; копию сделать не удалось, сохранение индекса заблокировано".into()),
+                warning: Some(
+                    "индекс кеша повреждён; копию сделать не удалось, сохранение индекса заблокировано".into(),
+                ),
                 save_blocked: true,
             },
         },
@@ -368,7 +442,9 @@ fn load_index(root: &Path, stamp: u128) -> LoadedIndex {
 /// when that failed or the name is taken.
 fn set_aside(path: &Path, stamp: u128) -> Option<String> {
     let backup = path.with_file_name(format!(".beat-index.corrupt-{stamp}.bak"));
-    if backup.exists() { return None; }
+    if backup.exists() {
+        return None;
+    }
     std::fs::rename(path, &backup).ok()?;
     backup.file_name().map(|name| name.to_string_lossy().into_owned())
 }
@@ -397,32 +473,39 @@ fn read_capped(path: &Path, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
 /// `.` or `..` parts, no drive/absolute forms, no characters Windows rejects,
 /// no trailing dot or space (Windows strips those, so the name would differ).
 pub fn is_safe_rel(rel: &str) -> bool {
-    !rel.is_empty() && rel.split('/').all(|part| {
-        !part.is_empty()
-            && part != "."
-            && part != ".."
-            && !is_device_name(part)
-            && !part.to_ascii_lowercase().starts_with(".beat-index.")
-            && !part.to_ascii_lowercase().ends_with(".part")
-            && !part.ends_with(['.', ' '])
-            && !part.chars().any(|c| c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*'))
-    })
+    !rel.is_empty()
+        && rel.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && !is_device_name(part)
+                && !part.to_ascii_lowercase().starts_with(".beat-index.")
+                && !part.to_ascii_lowercase().ends_with(".part")
+                && !part.ends_with(['.', ' '])
+                && !part.chars().any(|c| c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*'))
+        })
 }
 
 /// Refuse existing symlinks and Windows junctions at every level: a lexical
 /// path inside the cache can otherwise resolve outside it when read or deleted.
 fn safe_path(root: &Path, rel: &str) -> Option<PathBuf> {
-    if !is_safe_rel(rel) { return None; }
+    if !is_safe_rel(rel) {
+        return None;
+    }
     let mut path = root.to_path_buf();
     for part in rel.split('/') {
         path.push(part);
         match std::fs::symlink_metadata(&path) {
             Ok(meta) => {
-                if meta.file_type().is_symlink() { return None; }
+                if meta.file_type().is_symlink() {
+                    return None;
+                }
                 #[cfg(windows)]
                 {
                     use std::os::windows::fs::MetadataExt;
-                    if meta.file_attributes() & 0x400 != 0 { return None; } // FILE_ATTRIBUTE_REPARSE_POINT
+                    if meta.file_attributes() & 0x400 != 0 {
+                        return None;
+                    } // FILE_ATTRIBUTE_REPARSE_POINT
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -438,13 +521,94 @@ pub fn part_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// `Artist/Album/NN - Title.ext`, sanitized for Windows file names.
-fn relative_path(song: &Song, suffix: &str) -> PathBuf {
-    let artist = sanitize_component(&song.artist, "Неизвестный артист");
-    let album = sanitize_component(&song.album, "Без альбома");
-    let title = sanitize_component(&song.title, "Трек");
-    let track = if song.track > 0 { format!("{:02} - {title}", song.track) } else { title };
-    PathBuf::from(artist).join(album).join(format!("{track}.{suffix}"))
+/// Cheap "is this audio at all" probe on the first bytes of a finished
+/// download. Only container magic is looked for, so a format the decoder stack
+/// cannot play (opus inside an ogg container) is still cached as before, while
+/// an error page or a `200 OK` carrying "Bad Gateway" is refused. The window is
+/// a few kilobytes because an ID3v2 tag or a small amount of leading junk can
+/// sit before the first real frame.
+fn looks_like_audio(path: &Path) -> Result<(), String> {
+    use std::io::Read;
+    const WINDOW: usize = 4096;
+    let mut file = std::fs::File::open(path).map_err(|e| format!("не удалось открыть {}: {e}", path.display()))?;
+    let mut head = vec![0u8; WINDOW];
+    let read = file.read(&mut head).map_err(|e| format!("не удалось прочитать кеш: {e}"))?;
+    let head = &head[..read];
+    let textual =
+        head.windows(3).any(|w| w == b"ID3") || head.windows(4).any(|w| w == b"fLaC" || w == b"OggS" || w == b"ftyp");
+    let riff = head.windows(12).any(|w| &w[..4] == b"RIFF" && &w[8..12] == b"WAVE");
+    // Matroska/WebM, and the MPEG frame / ADTS sync word.
+    let binary = head.windows(4).any(|w| w == [0x1a, 0x45, 0xdf, 0xa3])
+        || head.windows(2).any(|w| w[0] == 0xff && w[1] & 0xe0 == 0xe0);
+    if textual || riff || binary {
+        Ok(())
+    } else {
+        Err("сервер прислал не аудиофайл".into())
+    }
+}
+
+/// Windows counts a path in UTF-16 units, so the budget has to be counted the
+/// same way: an emoji is two units, not one.
+fn utf16_len(text: &str) -> usize {
+    text.chars().map(char::len_utf16).sum()
+}
+
+/// Cuts `text` to at most `max` UTF-16 units, never splitting a character.
+fn truncate_utf16(text: &str, max: usize) -> &str {
+    let mut used = 0;
+    for (index, ch) in text.char_indices() {
+        let width = ch.len_utf16();
+        if used + width > max {
+            return &text[..index];
+        }
+        used += width;
+    }
+    text
+}
+
+/// `Artist/Album/NN - Title.ext`, sanitized for Windows file names and short
+/// enough that root + this stays inside `MAX_ABSOLUTE_PATH`. Tags are attacker
+/// -controlled data: three 200-character components would otherwise exceed
+/// `MAX_PATH` and fail the download with a confusing "cannot create" error.
+fn relative_path(song: &Song, suffix: &str, budget: usize) -> PathBuf {
+    let suffix = suffix.trim_start_matches('.');
+    let track_prefix = if song.track > 0 { format!("{:02} - ", song.track) } else { String::new() };
+    // Everything that is not one of the three free-text components.
+    let overhead = utf16_len(&track_prefix) + 1 /* '.' */ + utf16_len(suffix)
+        + 2 /* artist/album separators */ + PATH_HEADROOM;
+    let room = budget.saturating_sub(overhead);
+    let mut artist = sanitize_component(&song.artist, "Неизвестный артист", MAX_COMPONENT);
+    let mut album = sanitize_component(&song.album, "Без альбома", MAX_COMPONENT);
+    let mut title = sanitize_component(&song.title, "Трек", MAX_COMPONENT);
+    // Shrink the longest component until the three fit the room; the titles
+    // that need shortening are exactly the ones the user would recognise.
+    let mut excess =
+        [utf16_len(&artist), utf16_len(&album), utf16_len(&title)].into_iter().sum::<usize>().saturating_sub(room);
+    while excess > 0 {
+        let longest = [utf16_len(&artist), utf16_len(&album), utf16_len(&title)]
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, len)| **len)
+            .map(|(index, _)| index);
+        let Some(index) = longest else { break };
+        let slot = match index {
+            0 => &mut artist,
+            1 => &mut album,
+            _ => &mut title,
+        };
+        let current = utf16_len(slot);
+        if current == 0 {
+            // Nothing left to cut: the fixed parts alone exceed the budget.
+            // Truncating further would produce an empty component, and
+            // `sanitize_component` already replaced those with a fallback.
+            break;
+        }
+        let keep = current.saturating_sub(excess);
+        *slot = truncate_utf16(slot, keep).trim_end().to_owned();
+        excess = excess.saturating_sub(current - utf16_len(slot));
+    }
+    let title = if track_prefix.is_empty() { title } else { format!("{track_prefix}{title}") };
+    PathBuf::from(artist).join(album).join(format!("{title}.{suffix}"))
 }
 
 fn numbered_path(rel: &str, counter: u32) -> String {
@@ -463,7 +627,10 @@ fn numbered_path(rel: &str, counter: u32) -> String {
     }
 }
 
-pub fn sanitize_component(raw: &str, fallback: &str) -> String {
+/// One path component from a server tag: Windows-safe, never empty, and at most
+/// `max` UTF-16 units long (NTFS allows 255; the rest is room for the collision
+/// suffix and the `.part` file that are appended later).
+pub fn sanitize_component(raw: &str, fallback: &str, max: usize) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
         match ch {
@@ -471,15 +638,19 @@ pub fn sanitize_component(raw: &str, fallback: &str) -> String {
             c if c.is_control() => out.push('_'),
             c => out.push(c),
         }
-        if out.chars().count() >= 90 {
+        if utf16_len(&out) >= max {
             break;
         }
     }
-    let mut out = out.trim().trim_end_matches(['.', ' ']).to_owned();
+    let mut out = truncate_utf16(&out, max).trim().trim_end_matches(['.', ' ']).to_owned();
     if is_device_name(&out) {
         out.insert(0, '_');
     }
-    if out.is_empty() { fallback.to_owned() } else { out }
+    if out.is_empty() {
+        fallback.to_owned()
+    } else {
+        out
+    }
 }
 
 /// Windows reserves these names (with any extension) for devices; a file or
@@ -516,22 +687,18 @@ pub struct Progress {
 
 impl Progress {
     pub fn new(total: Option<u64>) -> Arc<Self> {
-        Arc::new(Self {
-            state: Mutex::new(ProgressState { total, ..ProgressState::default() }),
-            cond: Condvar::new(),
-        })
+        Arc::new(Self { state: Mutex::new(ProgressState { total, ..ProgressState::default() }), cond: Condvar::new() })
     }
 
     /// (downloaded, total, finished, failed)
     pub fn snapshot(&self) -> (u64, Option<u64>, bool, Option<String>) {
-        let state = self.state.lock().unwrap();
+        let state = crate::lock(&self.state);
         (state.downloaded, state.total, state.finished, state.failed.clone())
     }
 
     pub fn ratio(&self) -> Option<f32> {
-        let state = self.state.lock().unwrap();
-        state.total.filter(|total| *total > 0)
-            .map(|total| (state.downloaded as f32 / total as f32).min(1.0))
+        let state = crate::lock(&self.state);
+        state.total.filter(|total| *total > 0).map(|total| (state.downloaded as f32 / total as f32).min(1.0))
     }
 
     /// Blocks until at least `needed` bytes are downloaded, the download is
@@ -539,7 +706,7 @@ impl Progress {
     /// waiter that must be interruptible passes a `cancel` flag.
     pub fn wait_for(&self, needed: u64, timeout: Duration, cancel: Option<&AtomicBool>) -> Result<(), String> {
         let deadline = std::time::Instant::now() + timeout;
-        let mut state = self.state.lock().unwrap();
+        let mut state = crate::lock(&self.state);
         loop {
             if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
                 return Err("воспроизведение остановлено".into());
@@ -568,7 +735,7 @@ impl Progress {
     /// as a fraction of its length; `None` while that cannot be told (size
     /// unknown and the download still running).
     pub fn seekable_fraction(&self) -> Option<f32> {
-        let state = self.state.lock().unwrap();
+        let state = crate::lock(&self.state);
         if state.finished {
             return Some(1.0);
         }
@@ -578,12 +745,12 @@ impl Progress {
 
     /// The `.part` file being written, once the stream has been opened.
     pub fn part(&self) -> Option<PathBuf> {
-        self.state.lock().unwrap().part.clone()
+        crate::lock(&self.state).part.clone()
     }
 
     /// The stream is open and its `.part` file exists.
     fn opened(&self, part: PathBuf, total: Option<u64>) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = crate::lock(&self.state);
         state.part = Some(part);
         if total.is_some() {
             state.total = total;
@@ -593,24 +760,24 @@ impl Progress {
 
     fn set_total(&self, total: Option<u64>) {
         if let Some(total) = total {
-            self.state.lock().unwrap().total = Some(total);
+            crate::lock(&self.state).total = Some(total);
         }
     }
 
     fn add(&self, bytes: u64) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = crate::lock(&self.state);
         state.downloaded = state.downloaded.saturating_add(bytes);
         self.cond.notify_all();
     }
 
     fn finish(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = crate::lock(&self.state);
         state.finished = true;
         self.cond.notify_all();
     }
 
     fn fail(&self, message: String) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = crate::lock(&self.state);
         state.failed = Some(message);
         self.cond.notify_all();
     }
@@ -632,10 +799,15 @@ pub struct GrowingReader {
 
 impl GrowingReader {
     pub fn open(progress: Arc<Progress>, path: &Path) -> Result<Self, String> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| format!("не удалось открыть {}: {e}", path.display()))?;
-        Ok(Self { progress, file, pos: 0, path: path.to_path_buf(),
-            cancel: Arc::new(AtomicBool::new(false)), startup: Arc::new(AtomicBool::new(false)) })
+        let file = std::fs::File::open(path).map_err(|e| format!("не удалось открыть {}: {e}", path.display()))?;
+        Ok(Self {
+            progress,
+            file,
+            pos: 0,
+            path: path.to_path_buf(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            startup: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     /// Setting this flag makes a read that waits for the network return an
@@ -653,21 +825,24 @@ impl GrowingReader {
         if self.startup.load(Ordering::SeqCst) {
             let (downloaded, _, finished, failed) = self.progress.snapshot();
             if failed.is_none() && !finished && downloaded < needed {
-                return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock,
-                    "декодеру нужно дождаться дополнительных данных"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "декодеру нужно дождаться дополнительных данных",
+                ));
             }
         }
         self.progress
             .wait_for(needed, Duration::from_secs(60), Some(&self.cancel))
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut,
-                format!("{}: {e}", self.path.display())))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{}: {e}", self.path.display())))
     }
 }
 
 impl std::io::Read for GrowingReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         use std::io::{Seek, SeekFrom};
-        if buf.is_empty() { return Ok(0); }
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let (downloaded, _total, finished, failed) = self.progress.snapshot();
         if let Some(err) = failed {
             return Err(std::io::Error::other(err));
@@ -754,8 +929,11 @@ pub fn start_download(
     let handle = DlHandle { song: song.clone(), progress: progress.clone() };
     std::thread::spawn(move || {
         let id = song.id.clone();
-        let result = guarded(|| client.open_stream(&song)
-            .and_then(|stream| download_stream(&cache, &song, stream, &progress, &format_label)));
+        let result = guarded(|| {
+            client
+                .open_stream(&song)
+                .and_then(|stream| download_stream(&cache, &song, stream, &progress, &format_label))
+        });
         match result {
             Ok(entry) => {
                 progress.finish();
@@ -793,7 +971,9 @@ fn download_stream(
     // A panic in the worker must also free this reservation.
     struct Reservation<'a>(&'a Cache, PathBuf);
     impl Drop for Reservation<'_> {
-        fn drop(&mut self) { self.0.release(&self.1); }
+        fn drop(&mut self) {
+            self.0.release(&self.1);
+        }
     }
     let _reservation = Reservation(cache, path.clone());
     run_download(cache, song, stream, &part, &path, progress, format_label)
@@ -802,11 +982,16 @@ fn download_stream(
 /// Remove only a partial file opened by this download. A pre-existing `.part`
 /// may belong to the user or another process and must never be deleted on an
 /// `OpenOptions::create_new` failure.
-struct PartCleanup<'a> { path: &'a Path, created: bool }
+struct PartCleanup<'a> {
+    path: &'a Path,
+    created: bool,
+}
 
 impl Drop for PartCleanup<'_> {
     fn drop(&mut self) {
-        if self.created { let _ = std::fs::remove_file(self.path); }
+        if self.created {
+            let _ = std::fs::remove_file(self.path);
+        }
     }
 }
 
@@ -831,7 +1016,10 @@ fn run_download(
         std::fs::create_dir_all(parent).map_err(|e| format!("не удалось создать {parent:?}: {e}"))?;
     }
     let mut cleanup = PartCleanup { path: part, created: false };
-    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(part)
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(part)
         .map_err(|e| format!("не удалось создать {}: {e}", part.display()))?;
     cleanup.created = true;
     progress.opened(part.to_path_buf(), total);
@@ -839,7 +1027,9 @@ fn run_download(
     let mut written: u64 = 0;
     loop {
         let n = reader.read(&mut buf).map_err(|e| format!("поток оборвался: {e}"))?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         if written + n as u64 > max_bytes {
             return Err("поток превысил допустимый размер файла".into());
         }
@@ -858,15 +1048,21 @@ fn run_download(
             return Err("поток оборвался до конца трека".into());
         }
     }
-    if cache.resolve_rel(&path.strip_prefix(cache.root()).map_err(|e| e.to_string())?
-        .to_string_lossy().replace('\\', "/")).is_none() || path.exists() {
+    // A `200 OK` can still carry an HTML error page or a JSON body. Renaming
+    // that to the final name would index it as a finished track and leave the
+    // song unplayable until the user deleted the file by hand.
+    looks_like_audio(part)?;
+    if cache
+        .resolve_rel(&path.strip_prefix(cache.root()).map_err(|e| e.to_string())?.to_string_lossy().replace('\\', "/"))
+        .is_none()
+        || path.exists()
+    {
         return Err("путь файла кеша изменился во время загрузки".into());
     }
     std::fs::rename(part, path).map_err(|e| format!("не удалось завершить файл кеша: {e}"))?;
     cleanup.created = false;
     progress.set_total(Some(written));
-    let relative = path.strip_prefix(cache.root()).unwrap_or(path)
-        .to_string_lossy().replace('\\', "/");
+    let relative = path.strip_prefix(cache.root()).unwrap_or(path).to_string_lossy().replace('\\', "/");
     let entry = CachedTrack {
         id: song.id.clone(),
         path: relative,
@@ -887,30 +1083,50 @@ mod tests {
     use super::*;
 
     fn song(id: &str, artist: &str, album: &str, title: &str, track: u32) -> Song {
-        Song { id: id.into(), artist: artist.into(), album: album.into(), title: title.into(),
-            track, suffix: "mp3".into(), ..Song::default() }
+        Song {
+            id: id.into(),
+            artist: artist.into(),
+            album: album.into(),
+            title: title.into(),
+            track,
+            suffix: "mp3".into(),
+            ..Song::default()
+        }
     }
 
     #[test]
     fn components_are_sanitized_for_windows_paths() {
-        assert_eq!(sanitize_component("AC/DC", "x"), "AC_DC");
-        assert_eq!(sanitize_component("what?", "x"), "what_");
-        assert_eq!(sanitize_component("  ../evil  ", "x"), ".._evil");
-        assert_eq!(sanitize_component("", "fallback"), "fallback");
-        assert_eq!(sanitize_component("trailing. ", "x"), "trailing");
+        assert_eq!(sanitize_component("AC/DC", "x", MAX_COMPONENT), "AC_DC");
+        assert_eq!(sanitize_component("what?", "x", MAX_COMPONENT), "what_");
+        assert_eq!(sanitize_component("  ../evil  ", "x", MAX_COMPONENT), ".._evil");
+        assert_eq!(sanitize_component("", "fallback", MAX_COMPONENT), "fallback");
+        assert_eq!(sanitize_component("trailing. ", "x", MAX_COMPONENT), "trailing");
     }
 
     #[test]
     fn destinations_are_human_readable_and_unique() {
-        let root = std::env::temp_dir().join(format!("beat-cache-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let root = std::env::temp_dir().join(format!(
+            "beat-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
         let cache = Cache::load(root.clone());
         let (path, part) = cache.dest_for(&song("1", "Band", "Album", "Song", 3), "flac").unwrap();
         assert!(path.ends_with(std::path::Path::new("Band").join("Album").join("03 - Song.flac")));
         assert_eq!(part.file_name().unwrap().to_string_lossy(), "03 - Song.flac.part");
-        cache.insert(CachedTrack { id: "1".into(), path: "Band/Album/03 - Song.flac".into(),
-            title: "Song".into(), artist: "Band".into(), album: "Album".into(),
-            duration: 1.0, suffix: "flac".into(), size: 10, format: "raw".into() }).unwrap();
+        cache
+            .insert(CachedTrack {
+                id: "1".into(),
+                path: "Band/Album/03 - Song.flac".into(),
+                title: "Song".into(),
+                artist: "Band".into(),
+                album: "Album".into(),
+                duration: 1.0,
+                suffix: "flac".into(),
+                size: 10,
+                format: "raw".into(),
+            })
+            .unwrap();
         let (other, _) = cache.dest_for(&song("2", "Band", "Album", "Song", 3), "flac").unwrap();
         assert!(other.to_string_lossy().contains("03 - Song (2).flac"));
         let _ = std::fs::remove_dir_all(root);
@@ -918,14 +1134,27 @@ mod tests {
 
     #[test]
     fn index_roundtrips_and_prunes_missing_files() {
-        let root = std::env::temp_dir().join(format!("beat-index-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let root = std::env::temp_dir().join(format!(
+            "beat-index-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("a.mp3"), b"data").unwrap();
         let cache = Cache::load(root.clone());
-        cache.insert(CachedTrack { id: "a".into(), path: "a.mp3".into(), title: "A".into(),
-            artist: "X".into(), album: "Y".into(), duration: 1.0, suffix: "mp3".into(),
-            size: 4, format: "raw".into() }).unwrap();
+        cache
+            .insert(CachedTrack {
+                id: "a".into(),
+                path: "a.mp3".into(),
+                title: "A".into(),
+                artist: "X".into(),
+                album: "Y".into(),
+                duration: 1.0,
+                suffix: "mp3".into(),
+                size: 4,
+                format: "raw".into(),
+            })
+            .unwrap();
         assert!(cache.contains("a"));
         let reloaded = Cache::load(root.clone());
         assert_eq!(reloaded.stats(), (1, 4));
@@ -937,8 +1166,11 @@ mod tests {
 
     #[test]
     fn growing_reader_waits_for_the_writer() {
-        let root = std::env::temp_dir().join(format!("beat-grow-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let root = std::env::temp_dir().join(format!(
+            "beat-grow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("track.mp3.part");
         std::fs::write(&path, b"hello ").unwrap();
@@ -977,13 +1209,18 @@ mod tests {
         assert!(progress.wait_for(1, Duration::from_millis(100), None).is_err());
     }
 
-    /// `n` zero bytes, then end of stream.
+    /// `n` bytes of synthetic audio, then end of stream: a real container
+    /// header (a download that is not audio at all is refused before this) and
+    /// zeroed payload after it.
     struct Zeros(u64);
 
     impl std::io::Read for Zeros {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            const HEADER: &[u8] = b"ID3\x04\x00\x00\x00\x00";
             let n = (self.0.min(buf.len() as u64)) as usize;
             buf[..n].fill(0);
+            let header = HEADER.len().min(n);
+            buf[..header].copy_from_slice(&HEADER[..header]);
             self.0 -= n as u64;
             Ok(n)
         }
@@ -1025,18 +1262,21 @@ mod tests {
         let part = root.join("Band").join("Album").join("01 - Song.mp3.part");
         // Length unknown, and it just keeps coming.
         let stream = api::AudioStream { reader: Box::new(Zeros(1_000_000)), total: None, suffix: "mp3".into() };
-        let endless = download_stream(&cache, &song("1", "Band", "Album", "Song", 1), stream, &Progress::new(None), "raw");
+        let endless =
+            download_stream(&cache, &song("1", "Band", "Album", "Song", 1), stream, &Progress::new(None), "raw");
         assert!(endless.is_err(), "a 1 MB stream was accepted under a 10 kB limit");
         assert!(!part.exists(), "the oversized .part file was left behind");
         // Announced as too big: refused before a byte is written.
         let progress = Progress::new(None);
-        let stream = api::AudioStream { reader: Box::new(Zeros(1_000_000)), total: Some(1_000_000), suffix: "mp3".into() };
+        let stream =
+            api::AudioStream { reader: Box::new(Zeros(1_000_000)), total: Some(1_000_000), suffix: "mp3".into() };
         let announced = download_stream(&cache, &song("2", "Band", "Album", "Other", 2), stream, &progress, "raw");
         assert!(announced.is_err());
         assert_eq!(progress.snapshot().0, 0, "bytes were written for a track announced as too big");
         // A track within the limit still downloads.
         let stream = api::AudioStream { reader: Box::new(Zeros(5_000)), total: Some(5_000), suffix: "mp3".into() };
-        let fine = download_stream(&cache, &song("3", "Band", "Album", "Small", 3), stream, &Progress::new(None), "raw");
+        let fine =
+            download_stream(&cache, &song("3", "Band", "Album", "Small", 3), stream, &Progress::new(None), "raw");
         assert!(fine.is_ok(), "{fine:?}");
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1052,7 +1292,7 @@ mod tests {
         assert!(cache.remove("stuck").is_err(), "reported success for a file that is still there");
         assert!(cache.remove("missing").is_ok(), "a file that is already gone is not an error");
         let ids = |cache: &Cache| -> Vec<String> {
-            let mut ids: Vec<String> = cache.inner.index.lock().unwrap().keys().cloned().collect();
+            let mut ids: Vec<String> = crate::lock(&cache.inner.index).keys().cloned().collect();
             ids.sort();
             ids
         };
@@ -1068,11 +1308,11 @@ mod tests {
     #[test]
     fn windows_device_names_are_not_used_as_file_names() {
         for name in ["CON", "con", "Nul", "AUX", "prn", "COM1", "lpt9", "Con.Remix", "NUL "] {
-            let clean = sanitize_component(name, "x");
+            let clean = sanitize_component(name, "x", MAX_COMPONENT);
             assert!(clean.starts_with('_'), "{name:?} became {clean:?}");
         }
         for name in ["Console", "COM10", "Communication", "Aux Cord", "LPT0", "Nulla"] {
-            assert_eq!(sanitize_component(name, "x"), name, "{name:?} is a legal name");
+            assert_eq!(sanitize_component(name, "x", MAX_COMPONENT), name, "{name:?} is a legal name");
         }
     }
 
@@ -1086,16 +1326,20 @@ mod tests {
     fn concurrent_inserts_all_reach_the_index_file() {
         let root = temp_root("many-inserts");
         let cache = Cache::load(root.clone());
-        let workers: Vec<_> = (0..8).map(|worker| {
-            let cache = cache.clone();
-            std::thread::spawn(move || {
-                for n in 0..10 {
-                    let id = format!("w{worker}-{n}");
-                    cache.insert(CachedTrack { path: format!("{id}.mp3"), id, ..CachedTrack::default() }).unwrap();
-                }
+        let workers: Vec<_> = (0..8)
+            .map(|worker| {
+                let cache = cache.clone();
+                std::thread::spawn(move || {
+                    for n in 0..10 {
+                        let id = format!("w{worker}-{n}");
+                        cache.insert(CachedTrack { path: format!("{id}.mp3"), id, ..CachedTrack::default() }).unwrap();
+                    }
+                })
             })
-        }).collect();
-        for worker in workers { worker.join().unwrap(); }
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
         assert_eq!(Cache::load(root.clone()).stats().0, 80, "an older snapshot overwrote a newer one");
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1145,8 +1389,11 @@ mod tests {
     }
 
     fn temp_root(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("beat-{tag}-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()))
+        std::env::temp_dir().join(format!(
+            "beat-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ))
     }
 
     fn client_for(base: String) -> api::Client {
@@ -1175,8 +1422,7 @@ mod tests {
             drop(handle);
             let _ = done_tx.send(());
         });
-        assert!(done_rx.recv_timeout(Duration::from_secs(3)).is_ok(),
-            "start_download blocked on the network");
+        assert!(done_rx.recv_timeout(Duration::from_secs(3)).is_ok(), "start_download blocked on the network");
     }
 
     #[test]
@@ -1211,23 +1457,53 @@ mod tests {
     }
 
     fn write_index(root: &Path, entries: &[(&str, &str)]) {
-        let tracks: serde_json::Map<String, serde_json::Value> = entries.iter()
-            .map(|(id, path)| ((*id).to_owned(), serde_json::json!(
-                {"id": id, "path": path, "title": "T", "artist": "A", "album": "B"})))
+        let tracks: serde_json::Map<String, serde_json::Value> = entries
+            .iter()
+            .map(|(id, path)| {
+                (
+                    (*id).to_owned(),
+                    serde_json::json!(
+                {"id": id, "path": path, "title": "T", "artist": "A", "album": "B"}),
+                )
+            })
             .collect();
         std::fs::create_dir_all(root).unwrap();
-        std::fs::write(root.join(INDEX_FILE),
-            serde_json::to_vec(&serde_json::json!({"version": 1, "tracks": tracks})).unwrap()).unwrap();
+        std::fs::write(
+            root.join(INDEX_FILE),
+            serde_json::to_vec(&serde_json::json!({"version": 1, "tracks": tracks})).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
     fn relative_paths_must_stay_inside_the_cache() {
-        for good in ["a.mp3", "Band/Album/01 - Song.flac", "Группа/Альбом/Песня (2).mp3", "a b/c.d/e.mp3"] {
+        for good in ["a.mp3", "Band/Album/01 - Song.flac", "Группа/Альбом/Песня (2).mp3", "a b/c.d/e.mp3"]
+        {
             assert!(is_safe_rel(good), "{good} should be accepted");
         }
-        for bad in ["", "..", "../x.mp3", "a/../b.mp3", "./a.mp3", "a/./b.mp3", "/abs.mp3", "a//b.mp3",
-            "C:/x.mp3", "C:x.mp3", r"a\b.mp3", "a/b?.mp3", "a/b*.mp3", "a/b.mp3/", "dir./x.mp3", "dir /x.mp3",
-            "a/\u{0}.mp3", ".beat-index.json", ".beat-index.corrupt-1.bak", "a.mp3.part", "CON/track.mp3"] {
+        for bad in [
+            "",
+            "..",
+            "../x.mp3",
+            "a/../b.mp3",
+            "./a.mp3",
+            "a/./b.mp3",
+            "/abs.mp3",
+            "a//b.mp3",
+            "C:/x.mp3",
+            "C:x.mp3",
+            r"a\b.mp3",
+            "a/b?.mp3",
+            "a/b*.mp3",
+            "a/b.mp3/",
+            "dir./x.mp3",
+            "dir /x.mp3",
+            "a/\u{0}.mp3",
+            ".beat-index.json",
+            ".beat-index.corrupt-1.bak",
+            "a.mp3.part",
+            "CON/track.mp3",
+        ] {
             assert!(!is_safe_rel(bad), "{bad:?} should be refused");
         }
     }
@@ -1254,8 +1530,7 @@ mod tests {
     #[test]
     fn saving_settings_keeps_one_cache_per_folder() {
         let root = temp_root("same-root");
-        let entry = |id: &str| CachedTrack { id: id.into(), path: format!("{id}.mp3"),
-            ..CachedTrack::default() };
+        let entry = |id: &str| CachedTrack { id: id.into(), path: format!("{id}.mp3"), ..CachedTrack::default() };
         let running = Cache::load(root.clone());
         // Settings saved while a download is still running...
         let after_settings = running.for_root(root.clone());
@@ -1263,7 +1538,7 @@ mod tests {
         running.insert(entry("first")).unwrap();
         after_settings.insert(entry("second")).unwrap();
         let reloaded = Cache::load(root.clone());
-        let ids: Vec<String> = reloaded.inner.index.lock().unwrap().keys().cloned().collect();
+        let ids: Vec<String> = crate::lock(&reloaded.inner.index).keys().cloned().collect();
         assert!(ids.contains(&"first".to_owned()), "the first download vanished from the index: {ids:?}");
         assert!(ids.contains(&"second".to_owned()), "{ids:?}");
         let other = temp_root("other-root");
@@ -1363,9 +1638,12 @@ mod tests {
         let cache = Cache::load(root.clone());
         assert!(cache.warning().is_some(), "the user is never told the index was dropped");
         cache.insert(CachedTrack { id: "1".into(), path: "a.mp3".into(), ..CachedTrack::default() }).unwrap();
-        let backups: Vec<PathBuf> = std::fs::read_dir(&root).unwrap().flatten()
+        let backups: Vec<PathBuf> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
             .map(|entry| entry.path())
-            .filter(|path| path.file_name().unwrap().to_string_lossy().contains("corrupt")).collect();
+            .filter(|path| path.file_name().unwrap().to_string_lossy().contains("corrupt"))
+            .collect();
         assert_eq!(backups.len(), 1, "{backups:?}");
         assert_eq!(std::fs::read(&backups[0]).unwrap(), b"{ not json");
         let reloaded = Cache::load(root.clone());
@@ -1416,9 +1694,146 @@ mod tests {
         std::fs::create_dir_all(part.parent().unwrap()).unwrap();
         std::fs::write(&part, b"do not delete").unwrap();
         let stream = api::AudioStream { reader: Box::new(Zeros(10)), total: Some(10), suffix: "mp3".into() };
-        assert!(download_stream(&cache, &song("1", "Band", "Album", "Song", 1), stream,
-            &Progress::new(None), "raw").is_err());
+        assert!(download_stream(&cache, &song("1", "Band", "Album", "Song", 1), stream, &Progress::new(None), "raw")
+            .is_err());
         assert_eq!(std::fs::read(part).unwrap(), b"do not delete");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cache_paths_stay_inside_the_windows_path_limit() {
+        // Tags are server data: three long components would overflow MAX_PATH
+        // and fail the download with a confusing "cannot create" error.
+        let root = temp_root("long-path");
+        let cache = Cache::load(root.clone());
+        let long = "Песня".repeat(200);
+        let song = song("1", &long, &long, &long, 7);
+        let (path, part) = cache.dest_for(&song, "flac").unwrap();
+        let full = path.to_string_lossy().replace('/', "\\");
+        assert!(utf16_len(&full) <= MAX_ABSOLUTE_PATH, "{} UTF-16 units: {full}", utf16_len(&full));
+        // No component may exceed what NTFS accepts either.
+        for component in [
+            path.parent().unwrap(),
+            path.parent().unwrap().parent().unwrap(),
+            path.parent().unwrap().parent().unwrap().parent().unwrap(),
+        ] {
+            assert!(utf16_len(&component.file_name().unwrap().to_string_lossy()) <= MAX_COMPONENT);
+        }
+        // The track number and the extension survive the trimming.
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("07 - "), "{name}");
+        assert!(name.ends_with(".flac"), "{name}");
+        assert!(part.to_string_lossy().ends_with(".flac.part"));
+        // A deep cache root leaves less room, and is respected too.
+        let deep = root.join("a").join("b").join("c").join("d").join("e");
+        std::fs::create_dir_all(&deep).unwrap();
+        let nested = Cache::load(deep.clone());
+        let (nested_path, _) = nested.dest_for(&song, "mp3").unwrap();
+        assert!(utf16_len(&nested_path.to_string_lossy()) <= MAX_ABSOLUTE_PATH, "{nested_path:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_download_that_is_not_audio_is_refused_and_leaves_nothing_behind() {
+        // A `200 OK` carrying an HTML error page must not be indexed as a
+        // finished track: it would show "in cache" and never play.
+        let root = temp_root("not-audio");
+        let cache = Cache::load(root.clone());
+        let body = b"<!DOCTYPE html><html><body>502 Bad Gateway</body></html>".to_vec();
+        let stream =
+            api::AudioStream { reader: Box::new(std::io::Cursor::new(body)), total: Some(52), suffix: "mp3".into() };
+        let result =
+            download_stream(&cache, &song("1", "Band", "Album", "Song", 1), stream, &Progress::new(None), "raw");
+        assert!(result.is_err(), "an HTML error page was accepted as a track");
+        assert!(!root.join("Band").join("Album").join("01 - Song.mp3").exists());
+        assert!(!root.join("Band").join("Album").join("01 - Song.mp3.part").exists());
+        assert_eq!(cache.stats().0, 0, "the refused download reached the index");
+        // Short proxy answers are not audio either, even when they look like a
+        // plausible status line.
+        for reply in [&b"OK"[..], b"Not Found", br#"{"error":"nope"}"#] {
+            let cache = Cache::load(temp_root("not-audio-short"));
+            let stream = api::AudioStream {
+                reader: Box::new(std::io::Cursor::new(reply.to_vec())),
+                total: None,
+                suffix: "mp3".into(),
+            };
+            assert!(
+                download_stream(&cache, &song("1", "B", "A", "S", 1), stream, &Progress::new(None), "raw").is_err(),
+                "{reply:?} was accepted as a track"
+            );
+            let _ = std::fs::remove_dir_all(cache.root());
+        }
+
+        // Real audio in every supported container still gets through.
+        let heads: [(&[u8], &str); 5] = [
+            (b"ID3\x04\x00\x00", "id3.mp3"),
+            (b"fLaC\x00\x00\x00\x22", "flac.flac"),
+            (b"OggS\x00\x02", "ogg.ogg"),
+            (b"RIFF\x00\x00\x00\x00WAVEfmt ", "wave.wav"),
+            (&[0xff, 0xfb, 0x90, 0x00], "sync.mp3"),
+        ];
+        for (head, name) in heads {
+            let head = head.to_vec();
+            let cache = Cache::load(root.join(name));
+            let payload = [head.clone(), vec![0u8; 64]].concat();
+            let stream =
+                api::AudioStream { reader: Box::new(std::io::Cursor::new(payload)), total: None, suffix: "mp3".into() };
+            let entry =
+                download_stream(&cache, &song("1", "Band", "Album", "Song", 1), stream, &Progress::new(None), "raw")
+                    .unwrap_or_else(|err| panic!("{name} was refused: {err}"));
+            assert_eq!(entry.size as usize, head.len() + 64);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cached_statistics_survive_every_change_to_the_index() {
+        let root = temp_root("stats");
+        let cache = Cache::load(root.clone());
+        let entry = |id: &str, size: u64| CachedTrack {
+            id: id.into(),
+            path: format!("{id}.mp3"),
+            size,
+            ..CachedTrack::default()
+        };
+        assert_eq!(cache.stats(), (0, 0));
+        cache.insert(entry("a", 10)).unwrap();
+        cache.insert(entry("b", 20)).unwrap();
+        assert_eq!(cache.stats(), (2, 30), "insert did not update the counters");
+        cache.remove("a").unwrap();
+        assert_eq!(cache.stats(), (1, 20), "remove did not update the counters");
+        cache.clear().unwrap();
+        assert_eq!(cache.stats(), (0, 0), "clear did not update the counters");
+        // A file that vanished on its own is dropped by the next scan.
+        std::fs::write(root.join("c.mp3"), b"12345").unwrap();
+        cache.insert(entry("c", 5)).unwrap();
+        assert_eq!(cache.stats(), (1, 5));
+        std::fs::remove_file(root.join("c.mp3")).unwrap();
+        assert_eq!(cache.prune_missing(), 1);
+        assert_eq!(cache.stats(), (0, 0), "prune did not update the counters");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_index_is_never_copied_to_serialize_it() {
+        // `save_index` borrows the index under its lock; a regression to a
+        // clone would double the memory and the copy time per finished track.
+        let root = temp_root("no-clone");
+        let cache = Cache::load(root.clone());
+        for n in 0..50 {
+            cache
+                .insert(CachedTrack {
+                    id: format!("s{n}"),
+                    path: format!("s{n}.mp3"),
+                    size: n as u64,
+                    title: format!("T{n}"),
+                    ..CachedTrack::default()
+                })
+                .unwrap();
+        }
+        let reloaded = Cache::load(root.clone());
+        assert_eq!(reloaded.stats(), (50, (0..50u64).sum()));
+        assert_eq!(reloaded.list().len(), 0, "nothing was written to disk yet");
         let _ = std::fs::remove_dir_all(root);
     }
 

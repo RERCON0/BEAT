@@ -5,8 +5,8 @@
 use crate::api::MAX_DURATION_SECS;
 use crate::cache::{GrowingReader, Progress};
 use rodio::cpal::traits::HostTrait;
-use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player as Output};
 use rodio::Decoder;
+use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player as Output};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,8 +32,7 @@ pub struct Player {
 impl Player {
     pub fn new(volume: f32) -> Result<Self, String> {
         let stream_error = Arc::new(AtomicBool::new(false));
-        let sink = open_sink(stream_error.clone())
-            .map_err(|e| format!("аудиовыход недоступен: {e}"))?;
+        let sink = open_sink(stream_error.clone()).map_err(|e| format!("аудиовыход недоступен: {e}"))?;
         let output = Output::connect_new(sink.mixer());
         output.set_volume(volume);
         Ok(Self { _sink: sink, output, volume, stream_cancel: Mutex::new(None), stream_error })
@@ -47,7 +46,7 @@ impl Player {
 
     /// Releases the audio thread from the current stream's reader.
     fn cancel_stream(&self) {
-        if let Some(flag) = self.stream_cancel.lock().unwrap().take() {
+        if let Some(flag) = crate::lock(&self.stream_cancel).take() {
             flag.store(true, Ordering::SeqCst);
         }
     }
@@ -74,7 +73,7 @@ impl Player {
         startup.store(false, Ordering::SeqCst);
         self.cancel_stream();
         self.output.clear();
-        *self.stream_cancel.lock().unwrap() = Some(cancel);
+        *crate::lock(&self.stream_cancel) = Some(cancel);
         self.output.append(decoder);
         self.output.play();
         Ok(())
@@ -86,12 +85,20 @@ impl Player {
         self.output.clear();
     }
 
-    pub fn pause(&self) { self.output.pause(); }
-    pub fn resume(&self) { self.output.play(); }
-    pub fn is_paused(&self) -> bool { self.output.is_paused() }
+    pub fn pause(&self) {
+        self.output.pause();
+    }
+    pub fn resume(&self) {
+        self.output.play();
+    }
+    pub fn is_paused(&self) -> bool {
+        self.output.is_paused()
+    }
 
     /// True when nothing is queued/paying anymore (track finished).
-    pub fn ended(&self) -> bool { self.output.empty() }
+    pub fn ended(&self) -> bool {
+        self.output.empty()
+    }
 
     pub fn position(&self) -> f64 {
         self.output.get_pos().as_secs_f64()
@@ -104,8 +111,7 @@ impl Player {
             return Err("аудиоустройство недоступно".into());
         }
         let target = seek_duration(seconds).ok_or_else(|| "некорректная позиция перемотки".to_string())?;
-        self.output.try_seek(target)
-            .map_err(|e| format!("перемотка недоступна: {e}"))
+        self.output.try_seek(target).map_err(|e| format!("перемотка недоступна: {e}"))
     }
 
     pub fn set_volume(&mut self, volume: f32) {
@@ -113,7 +119,9 @@ impl Player {
         self.output.set_volume(self.volume);
     }
 
-    pub fn volume(&self) -> f32 { self.volume }
+    pub fn volume(&self) -> f32 {
+        self.volume
+    }
 }
 
 /// Opens the default output device with an error callback that records stream
@@ -174,11 +182,8 @@ fn seek_duration(seconds: f64) -> Option<Duration> {
 /// mark the source seekable: without it symphonia refuses every backward seek
 /// (slider, "previous track" restart) and mp3 has no total duration.
 fn open_file_decoder(path: &Path) -> Result<Decoder<std::io::BufReader<std::fs::File>>, String> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("не удалось открыть {}: {e}", path.display()))?;
-    let len = file.metadata()
-        .map_err(|e| format!("не удалось прочитать {}: {e}", path.display()))?
-        .len();
+    let file = std::fs::File::open(path).map_err(|e| format!("не удалось открыть {}: {e}", path.display()))?;
+    let len = file.metadata().map_err(|e| format!("не удалось прочитать {}: {e}", path.display()))?.len();
     guard_decoder(|| {
         Decoder::builder()
             .with_data(std::io::BufReader::new(file))
@@ -250,8 +255,11 @@ mod tests {
 
     #[test]
     fn a_file_decoder_seeks_backwards_as_well_as_forwards() {
-        let path = std::env::temp_dir().join(format!("beat-seek-{}-{}.wav", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let path = std::env::temp_dir().join(format!(
+            "beat-seek-{}-{}.wav",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
         write_wav(&path, 3);
         let mut decoder = open_file_decoder(&path).unwrap();
         // Play a little, like the player does before the user touches the slider.

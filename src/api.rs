@@ -1,6 +1,14 @@
 //! Navidrome (Subsonic API) client. Auth is token-based: `t = md5(password +
 //! salt)` with a random per-run salt, so the password itself never travels in
 //! a URL. Everything is read with a size cap and errors are redacted.
+//!
+//! The token *does* travel in the query string, because that is what the
+//! Subsonic protocol prescribes — which means any proxy, `netsh trace` or WAF
+//! between BEAT and the server sees a full account credential. It cannot be
+//! moved out of the URL, so the code does what it can instead: redirects are
+//! followed only inside the configured origin (`redirect_policy`), and the
+//! token, the salt and the password are scrubbed from every message the user
+//! sees (`Client::redact`).
 
 use crate::config::{Config, StreamFormat};
 use md5::{Digest, Md5};
@@ -144,19 +152,21 @@ impl Client {
     }
 
     pub fn album_list(&self, kind: &str, size: u32, offset: u32) -> Result<Vec<Album>, String> {
-        let v = self.get_json("getAlbumList2.view", &[
-            ("type", kind), ("size", &size.to_string()), ("offset", &offset.to_string())])?;
+        let v = self.get_json(
+            "getAlbumList2.view",
+            &[("type", kind), ("size", &size.to_string()), ("offset", &offset.to_string())],
+        )?;
         let Some(list) = v.get("albumList2").and_then(|list| list.as_object()) else {
             return Err("сервер не прислал список альбомов".into());
         };
         if list.get("album").is_some_and(|albums| !albums.is_array()) {
             return Err("сервер прислал некорректный список альбомов".into());
         }
-        let albums = parse_album_list(&v);
-        if list.get("album").and_then(|albums| albums.as_array()).is_some_and(|raw| raw.len() != albums.len()) {
-            return Err("сервер прислал альбом без ID или с неверными данными".into());
-        }
-        Ok(albums)
+        // A malformed entry is dropped rather than failing the page: this list
+        // only fills the album grid, where one broken row from a non-Navidrome
+        // server must not hide every other album. The full-library walk uses
+        // `catalog_album`, which stays strict on purpose (see its doc comment).
+        Ok(parse_album_list(&v))
     }
 
     /// Strict variant for a full-library scan. The regular album view can
@@ -174,11 +184,12 @@ impl Client {
             return Err("сервер прислал некорректный список песен".into());
         }
         let songs = parse_album(&v).1;
-        let declared_count = album.get("songCount").map(|count| {
-            count.as_u64().or_else(|| count.as_str().and_then(|text| text.trim().parse::<u64>().ok()))
-        });
+        let declared_count = album
+            .get("songCount")
+            .map(|count| count.as_u64().or_else(|| count.as_str().and_then(|text| text.trim().parse::<u64>().ok())));
         if album.get("song").and_then(|songs| songs.as_array()).is_some_and(|raw| raw.len() != songs.len())
-            || declared_count.is_some_and(|count| count != Some(songs.len() as u64)) {
+            || declared_count.is_some_and(|count| count != Some(songs.len() as u64))
+        {
             return Err("сервер прислал неполный список песен альбома".into());
         }
         Ok(songs)
@@ -191,8 +202,10 @@ impl Client {
     }
 
     pub fn search(&self, query: &str) -> Result<SearchResult, String> {
-        let v = self.get_json("search3.view", &[
-            ("query", query), ("artistCount", "8"), ("albumCount", "8"), ("songCount", "30")])?;
+        let v = self.get_json(
+            "search3.view",
+            &[("query", query), ("artistCount", "8"), ("albumCount", "8"), ("songCount", "30")],
+        )?;
         Ok(parse_search(&v))
     }
 
@@ -215,17 +228,12 @@ impl Client {
             StreamFormat::Raw => ("raw", safe_suffix(&song.suffix), None),
             StreamFormat::Mp3 => ("mp3", "mp3".to_owned(), Some(self.bit_rate.to_string())),
         };
-        let mut params = vec![
-            ("id", song.id.as_str()),
-            ("estimateContentLength", "true"),
-            ("format", format),
-        ];
+        let mut params = vec![("id", song.id.as_str()), ("estimateContentLength", "true"), ("format", format)];
         if let Some(rate) = max_bit_rate.as_deref() {
             params.push(("maxBitRate", rate));
         }
         let url = self.url("stream.view", &params)?;
-        let mut resp = self.stream_http.get(url).send()
-            .map_err(|e| self.redact(describe_network_error(&e)))?;
+        let mut resp = self.stream_http.get(url).send().map_err(|e| self.redact(describe_network_error(&e)))?;
         let status = resp.status();
         if !status.is_success() {
             let body = read_capped(&mut resp, 256 * 1024).unwrap_or_default();
@@ -293,9 +301,7 @@ fn redirect_policy(base: &str) -> reqwest::redirect::Policy {
 }
 
 fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
-    a.scheme() == b.scheme()
-        && a.host_str() == b.host_str()
-        && a.port_or_known_default() == b.port_or_known_default()
+    a.scheme() == b.scheme() && a.host_str() == b.host_str() && a.port_or_known_default() == b.port_or_known_default()
 }
 
 /// Same rule as the rest of the family: HTTPS only, HTTP just for localhost.
@@ -306,8 +312,10 @@ fn checked_base_url(raw: &str) -> Result<String, String> {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     let local = host == "localhost" || bare.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
     if (url.scheme() != "https" && !(url.scheme() == "http" && local))
-        || !url.username().is_empty() || url.password().is_some()
-        || url.query().is_some() || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
     {
         return Err("адрес сервера должен быть HTTPS (HTTP допустим только для localhost) и без логина, параметров или фрагмента".into());
     }
@@ -332,18 +340,17 @@ fn md5_hex(input: &str) -> String {
     hasher.update(input.as_bytes());
     let digest = hasher.finalize();
     let mut out = String::with_capacity(32);
-    for byte in digest { out.push_str(&format!("{byte:02x}")); }
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
     out
 }
 
 /// Extensions are used for cache file names and a symphonia hint: keep them
 /// short, alphanumeric, lowercase.
 fn safe_suffix(suffix: &str) -> String {
-    let cleaned: String = suffix.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .take(5)
-        .collect::<String>()
-        .to_ascii_lowercase();
+    let cleaned: String =
+        suffix.chars().filter(|c| c.is_ascii_alphanumeric()).take(5).collect::<String>().to_ascii_lowercase();
     match cleaned.as_str() {
         "mp3" | "flac" | "ogg" | "oga" | "opus" | "wav" | "m4a" | "aac" | "mp4" | "wv" => cleaned,
         _ => "mp3".to_owned(),
@@ -353,9 +360,13 @@ fn safe_suffix(suffix: &str) -> String {
 fn read_capped(resp: &mut reqwest::blocking::Response, cap: usize) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let mut bytes = Vec::new();
-    resp.by_ref().take(cap as u64 + 1).read_to_end(&mut bytes)
+    resp.by_ref()
+        .take(cap as u64 + 1)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("не удалось прочитать ответ сервера: {e}"))?;
-    if bytes.len() > cap { return Err("ответ сервера слишком большой".into()); }
+    if bytes.len() > cap {
+        return Err("ответ сервера слишком большой".into());
+    }
     Ok(bytes)
 }
 
@@ -389,14 +400,38 @@ fn snippet(body: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn de_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum N { U(u64), F(f64), S(String) }
-    Ok(match N::deserialize(d)? {
-        N::U(v) => v,
-        N::F(v) => v.max(0.0) as u64,
-        N::S(s) => s.trim().parse().unwrap_or(0),
-    })
+    d.deserialize_any(U64Visitor)
+}
+
+/// Server numbers arrive as numbers or as strings, and a field the server did
+/// not fill in arrives as `null` or a bool. A tolerant visitor keeps one odd
+/// field from discarding the whole artist/album/song it belongs to.
+struct U64Visitor;
+
+impl<'de> serde::de::Visitor<'de> for U64Visitor {
+    type Value = u64;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a number or a numeric string")
+    }
+    fn visit_u64<E>(self, value: u64) -> Result<u64, E> {
+        Ok(value)
+    }
+    fn visit_i64<E>(self, value: i64) -> Result<u64, E> {
+        Ok(value.max(0) as u64)
+    }
+    fn visit_f64<E>(self, value: f64) -> Result<u64, E> {
+        Ok(if value.is_finite() { value.max(0.0) as u64 } else { 0 })
+    }
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<u64, E> {
+        Ok(value.trim().parse().unwrap_or(0))
+    }
+    fn visit_unit<E>(self) -> Result<u64, E> {
+        Ok(0)
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<u64, E> {
+        Ok(0)
+    }
 }
 
 fn de_u32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
@@ -404,15 +439,36 @@ fn de_u32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
 }
 
 fn de_f64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum N { F(f64), U(u64), S(String) }
-    let seconds = match N::deserialize(d)? {
-        N::F(v) => v,
-        N::U(v) => v as f64,
-        N::S(s) => s.trim().parse().unwrap_or(0.0),
-    };
+    let seconds = d.deserialize_any(F64Visitor)?;
     Ok(if seconds.is_finite() { seconds.clamp(0.0, MAX_DURATION_SECS) } else { 0.0 })
+}
+
+struct F64Visitor;
+
+impl<'de> serde::de::Visitor<'de> for F64Visitor {
+    type Value = f64;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a number or a numeric string")
+    }
+    fn visit_f64<E>(self, value: f64) -> Result<f64, E> {
+        Ok(value)
+    }
+    fn visit_u64<E>(self, value: u64) -> Result<f64, E> {
+        Ok(value as f64)
+    }
+    fn visit_i64<E>(self, value: i64) -> Result<f64, E> {
+        Ok(value as f64)
+    }
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<f64, E> {
+        Ok(value.trim().parse().unwrap_or(0.0))
+    }
+    fn visit_unit<E>(self) -> Result<f64, E> {
+        Ok(0.0)
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<f64, E> {
+        Ok(0.0)
+    }
 }
 
 /// Whole seconds, bounded like `de_f64`.
@@ -480,13 +536,18 @@ pub struct SearchResult {
 
 /// `subsonic-response` envelope: `status` + an optional `error` object.
 fn parse_response(body: &str) -> Result<serde_json::Value, String> {
-    let mut value: serde_json::Value = serde_json::from_str(body)
-        .map_err(|_| "не удалось разобрать ответ сервера".to_string())?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| "не удалось разобрать ответ сервера".to_string())?;
     // Taken out of the envelope, not cloned: the payload can be megabytes.
-    let response = value.get_mut("subsonic-response").map(serde_json::Value::take)
+    let response = value
+        .get_mut("subsonic-response")
+        .map(serde_json::Value::take)
         .ok_or("ответ не похож на Subsonic API (нет subsonic-response)")?;
     if response.get("status").and_then(|s| s.as_str()) != Some("ok") {
-        let message = response.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str())
+        let message = response
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
             .unwrap_or("сервер отклонил запрос");
         let message = snippet(message);
         let code = response.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_u64());
@@ -521,9 +582,15 @@ fn parse_artists(response: &serde_json::Value) -> Vec<Artist> {
 fn parse_artist(response: &serde_json::Value) -> (Artist, Vec<Album>) {
     let Some(node) = response.get("artist") else { return (Artist::default(), Vec::new()) };
     let artist = serde_json::from_value::<Artist>(node.clone()).unwrap_or_default();
-    let mut albums: Vec<Album> = node.get("album").and_then(|a| a.as_array())
-        .map(|list| list.iter().filter_map(|a| serde_json::from_value::<Album>(a.clone()).ok())
-            .filter(|a| !a.id.is_empty()).collect())
+    let mut albums: Vec<Album> = node
+        .get("album")
+        .and_then(|a| a.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|a| serde_json::from_value::<Album>(a.clone()).ok())
+                .filter(|a| !a.id.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
     albums.sort_by_cached_key(|album| (album.year, album.name.to_lowercase()));
     (artist, albums)
@@ -532,18 +599,30 @@ fn parse_artist(response: &serde_json::Value) -> (Artist, Vec<Album>) {
 fn parse_album(response: &serde_json::Value) -> (Album, Vec<Song>) {
     let Some(node) = response.get("album") else { return (Album::default(), Vec::new()) };
     let album = serde_json::from_value::<Album>(node.clone()).unwrap_or_default();
-    let mut songs: Vec<Song> = node.get("song").and_then(|s| s.as_array())
-        .map(|list| list.iter().filter_map(|s| serde_json::from_value::<Song>(s.clone()).ok())
-            .filter(|s| !s.id.is_empty()).collect())
+    let mut songs: Vec<Song> = node
+        .get("song")
+        .and_then(|s| s.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|s| serde_json::from_value::<Song>(s.clone()).ok())
+                .filter(|s| !s.id.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
     songs.sort_by_key(|s| s.track);
     (album, songs)
 }
 
 fn parse_album_list(response: &serde_json::Value) -> Vec<Album> {
-    response.pointer("/albumList2/album").and_then(|a| a.as_array())
-        .map(|list| list.iter().filter_map(|a| serde_json::from_value::<Album>(a.clone()).ok())
-            .filter(|a| !a.id.is_empty()).collect())
+    response
+        .pointer("/albumList2/album")
+        .and_then(|a| a.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|a| serde_json::from_value::<Album>(a.clone()).ok())
+                .filter(|a| !a.id.is_empty())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -551,9 +630,24 @@ fn parse_search(response: &serde_json::Value) -> SearchResult {
     let Some(node) = response.get("searchResult3") else { return SearchResult::default() };
     let list = |key: &str| node.get(key).and_then(|a| a.as_array());
     SearchResult {
-        artists: list("artist").into_iter().flatten().filter_map(|a| serde_json::from_value::<Artist>(a.clone()).ok()).filter(|a| !a.id.is_empty()).collect(),
-        albums: list("album").into_iter().flatten().filter_map(|a| serde_json::from_value::<Album>(a.clone()).ok()).filter(|a| !a.id.is_empty()).collect(),
-        songs: list("song").into_iter().flatten().filter_map(|s| serde_json::from_value::<Song>(s.clone()).ok()).filter(|s| !s.id.is_empty()).collect(),
+        artists: list("artist")
+            .into_iter()
+            .flatten()
+            .filter_map(|a| serde_json::from_value::<Artist>(a.clone()).ok())
+            .filter(|a| !a.id.is_empty())
+            .collect(),
+        albums: list("album")
+            .into_iter()
+            .flatten()
+            .filter_map(|a| serde_json::from_value::<Album>(a.clone()).ok())
+            .filter(|a| !a.id.is_empty())
+            .collect(),
+        songs: list("song")
+            .into_iter()
+            .flatten()
+            .filter_map(|s| serde_json::from_value::<Song>(s.clone()).ok())
+            .filter(|s| !s.id.is_empty())
+            .collect(),
     }
 }
 
@@ -684,13 +778,15 @@ mod tests {
 
     #[test]
     fn subsonic_error_status_is_reported() {
-        let body = r#"{"subsonic-response":{"status":"failed","error":{"code":40,"message":"Wrong username or password"}}}"#;
+        let body =
+            r#"{"subsonic-response":{"status":"failed","error":{"code":40,"message":"Wrong username or password"}}}"#;
         let err = parse_response(body).unwrap_err();
         assert!(err.contains("Wrong username or password"));
         assert!(err.contains("40"));
         assert!(parse_response("<html>bad gateway</html>").is_err());
         assert!(parse_response(r#"{"other":1}"#).is_err());
-        let oversized = serde_json::json!({"subsonic-response": {"status": "failed", "error": {"message": "x".repeat(1000)}}});
+        let oversized =
+            serde_json::json!({"subsonic-response": {"status": "failed", "error": {"message": "x".repeat(1000)}}});
         assert!(parse_response(&oversized.to_string()).unwrap_err().chars().count() < 400);
     }
 
@@ -703,18 +799,54 @@ mod tests {
             (r#"{"subsonic-response":{"status":"ok","album":{"id":"9","song":[{"id":""}]}}}"#, true),
             (r#"{"subsonic-response":{"status":"ok","album":{"id":"8","song":[{"id":"a"}]}}}"#, true),
             (r#"{"subsonic-response":{"status":"ok","album":{"id":"9","songCount":"","song":[{"id":"a"}]}}}"#, true),
-            (r#"{"subsonic-response":{"status":"ok","album":{"id":"9","songCount":"2","song":[{"id":"a"},{"id":"b"}]}}}"#, false),
+            (
+                r#"{"subsonic-response":{"status":"ok","album":{"id":"9","songCount":"2","song":[{"id":"a"},{"id":"b"}]}}}"#,
+                false,
+            ),
         ];
         for (body, must_fail) in scenarios {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let base = format!("http://{}/", listener.local_addr().unwrap());
             let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             let server = serve(listener, 1, move |_| reply.clone());
-            let client = Client::new(&Server { base, user: "u".into(), password: "p".into() }, StreamFormat::Raw, 320).unwrap();
+            let client =
+                Client::new(&Server { base, user: "u".into(), password: "p".into() }, StreamFormat::Raw, 320).unwrap();
             let result = client.catalog_album("9");
             server.join().unwrap();
             assert_eq!(result.is_err(), must_fail, "{body}");
         }
+    }
+
+    #[test]
+    fn one_odd_field_does_not_discard_the_whole_object() {
+        // A server that sends `null` or a bool where a number belongs used to
+        // make the entire artist/album fail to parse and vanish from the list.
+        let body = r#"{"subsonic-response":{"status":"ok","artists":{"index":[
+            {"name":"a","artist":[{"id":"1","name":"Alpha","albumCount":null}]},
+            {"name":"b","artist":[{"id":"2","name":"Beta","albumCount":true}]},
+            {"name":"c","artist":[{"id":"3","name":"Gamma","albumCount":"7"}]}
+        ]}}}"#;
+        let response = parse_response(body).unwrap();
+        let artists = parse_artists(&response);
+        assert_eq!(artists.len(), 3, "artists were dropped: {artists:?}");
+        assert_eq!(artists.iter().map(|a| a.album_count).collect::<Vec<_>>(), [0, 0, 7]);
+    }
+
+    #[test]
+    fn durations_survive_a_null_or_bool_field() {
+        let body = r#"{"subsonic-response":{"status":"ok","album":{"id":"9","song":[
+            {"id":"a","title":"Null","duration":null},
+            {"id":"b","title":"Bool","duration":true},
+            {"id":"c","title":"Neg","duration":-5},
+            {"id":"d","title":"Text","duration":"1e400"}
+        ]}}}"#;
+        let response = parse_response(body).unwrap();
+        let (_, songs) = parse_album(&response);
+        assert_eq!(songs.len(), 4, "songs were dropped: {songs:?}");
+        for song in &songs {
+            assert!(song.duration.is_finite() && song.duration >= 0.0, "{song:?}");
+        }
+        assert_eq!(songs[3].duration, 0.0);
     }
 
     #[test]
@@ -729,8 +861,11 @@ mod tests {
 
     /// Answers each accepted connection with `respond(request line)` and returns
     /// the request lines it saw once `count` requests were served.
-    fn serve(listener: std::net::TcpListener, count: usize,
-        respond: impl Fn(&str) -> String + Send + 'static) -> std::thread::JoinHandle<Vec<String>> {
+    fn serve(
+        listener: std::net::TcpListener,
+        count: usize,
+        respond: impl Fn(&str) -> String + Send + 'static,
+    ) -> std::thread::JoinHandle<Vec<String>> {
         use std::io::{Read, Write};
         std::thread::spawn(move || {
             let mut seen = Vec::new();
@@ -741,9 +876,13 @@ mod tests {
                 let mut buf = [0u8; 4096];
                 loop {
                     let n = stream.read(&mut buf).unwrap();
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     request.extend_from_slice(&buf[..n]);
-                    if request.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
                 }
                 let line = String::from_utf8_lossy(&request).lines().next().unwrap_or_default().to_owned();
                 let reply = respond(&line);
@@ -785,10 +924,13 @@ mod tests {
         let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}/", first.local_addr().unwrap());
         let server = serve(first, 1, move |line| {
-            let query = line.split_once('?').map(|(_, rest)| rest.split(' ').next().unwrap_or_default()).unwrap_or_default();
+            let query =
+                line.split_once('?').map(|(_, rest)| rest.split(' ').next().unwrap_or_default()).unwrap_or_default();
             format!("HTTP/1.1 302 Found\r\nLocation: http://{other_addr}/rest/ping.view?{query}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
         });
-        let client = Client::new(&Server { base, user: "u".into(), password: "hunter2".into() }, StreamFormat::Raw, 320).unwrap();
+        let client =
+            Client::new(&Server { base, user: "u".into(), password: "hunter2".into() }, StreamFormat::Raw, 320)
+                .unwrap();
         let result = client.ping();
         server.join().unwrap();
         watcher.join().unwrap();
@@ -808,7 +950,8 @@ mod tests {
                 "HTTP/1.1 301 Moved Permanently\r\nLocation: /rest/ping.view?again=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
             }
         });
-        let client = Client::new(&Server { base, user: "u".into(), password: "p".into() }, StreamFormat::Raw, 320).unwrap();
+        let client =
+            Client::new(&Server { base, user: "u".into(), password: "p".into() }, StreamFormat::Raw, 320).unwrap();
         let result = client.ping();
         let seen = server.join().unwrap();
         assert!(result.is_ok(), "{result:?}");
@@ -832,7 +975,9 @@ mod tests {
                     let n = stream.read(&mut buf).unwrap();
                     assert!(n > 0);
                     request.extend_from_slice(&buf[..n]);
-                    if request.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
                 }
                 let headers = String::from_utf8_lossy(&request).into_owned();
                 let line = headers.lines().next().unwrap_or_default().to_owned();

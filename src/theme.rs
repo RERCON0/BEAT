@@ -1,10 +1,9 @@
 //! Same "Terminal Native" system as SNATCH and STRIKE (square corners,
 //! hairline ghost buttons, one accent used sparingly), in a day/night pair:
 //! every color is a getter over the active mode instead of a constant, so the
-//! whole UI flips with one call. The full shared palette lives here even where
-//! BEAT does not use every entry yet, hence the module-wide dead-code allow.
-
-#![allow(dead_code)]
+//! whole UI flips with one call. The palette is shared with those two apps, so
+//! a few entries BEAT does not draw yet are kept and marked individually rather
+//! than silencing the whole module.
 
 use eframe::egui;
 use egui::Color32;
@@ -25,62 +24,124 @@ fn rgb(r: u8, g: u8, b: u8) -> Color32 {
 }
 
 pub fn bg() -> Color32 {
-    if is_dark() { rgb(0x0b, 0x0b, 0x0e) } else { rgb(0xf3, 0xf3, 0xf1) }
+    if is_dark() {
+        rgb(0x0b, 0x0b, 0x0e)
+    } else {
+        rgb(0xf3, 0xf3, 0xf1)
+    }
 }
 
 pub fn lift() -> Color32 {
-    if is_dark() { rgb(0x0e, 0x0e, 0x11) } else { rgb(0xff, 0xff, 0xff) }
+    if is_dark() {
+        rgb(0x0e, 0x0e, 0x11)
+    } else {
+        rgb(0xff, 0xff, 0xff)
+    }
 }
 
 pub fn field() -> Color32 {
-    if is_dark() { rgb(0x11, 0x11, 0x14) } else { rgb(0xfb, 0xfb, 0xfa) }
+    if is_dark() {
+        rgb(0x11, 0x11, 0x14)
+    } else {
+        rgb(0xfb, 0xfb, 0xfa)
+    }
 }
 
 pub fn line() -> Color32 {
-    if is_dark() { rgb(0x1e, 0x1e, 0x24) } else { rgb(0xda, 0xda, 0xd6) }
+    if is_dark() {
+        rgb(0x1e, 0x1e, 0x24)
+    } else {
+        rgb(0xda, 0xda, 0xd6)
+    }
 }
 
+/// Part of the shared palette; BEAT does not draw it yet.
+#[allow(dead_code)]
 pub fn line2() -> Color32 {
-    if is_dark() { rgb(0x33, 0x33, 0x3c) } else { rgb(0xb5, 0xb5, 0xb0) }
+    if is_dark() {
+        rgb(0x33, 0x33, 0x3c)
+    } else {
+        rgb(0xb5, 0xb5, 0xb0)
+    }
 }
 
 pub fn text() -> Color32 {
-    if is_dark() { rgb(0xd6, 0xd6, 0xda) } else { rgb(0x1c, 0x1c, 0x1e) }
+    if is_dark() {
+        rgb(0xd6, 0xd6, 0xda)
+    } else {
+        rgb(0x1c, 0x1c, 0x1e)
+    }
 }
 
 pub fn dim() -> Color32 {
-    if is_dark() { rgb(0x83, 0x83, 0x8c) } else { rgb(0x5c, 0x5c, 0x62) }
+    if is_dark() {
+        rgb(0x83, 0x83, 0x8c)
+    } else {
+        rgb(0x5c, 0x5c, 0x62)
+    }
 }
 
 pub fn faint() -> Color32 {
-    if is_dark() { rgb(0x53, 0x53, 0x5c) } else { rgb(0x9a, 0x9a, 0x9f) }
+    if is_dark() {
+        rgb(0x53, 0x53, 0x5c)
+    } else {
+        rgb(0x9a, 0x9a, 0x9f)
+    }
 }
 
 pub fn accent() -> Color32 {
-    if is_dark() { rgb(0x59, 0xd6, 0x8c) } else { rgb(0x1a, 0x7f, 0x37) }
+    if is_dark() {
+        rgb(0x59, 0xd6, 0x8c)
+    } else {
+        rgb(0x1a, 0x7f, 0x37)
+    }
 }
 
 pub fn warn() -> Color32 {
-    if is_dark() { rgb(0xe0, 0xb3, 0x4d) } else { rgb(0x9a, 0x67, 0x00) }
+    if is_dark() {
+        rgb(0xe0, 0xb3, 0x4d)
+    } else {
+        rgb(0x9a, 0x67, 0x00)
+    }
 }
 
 pub fn err() -> Color32 {
-    if is_dark() { rgb(0xe0, 0x65, 0x5c) } else { rgb(0xcf, 0x22, 0x2e) }
+    if is_dark() {
+        rgb(0xe0, 0x65, 0x5c)
+    } else {
+        rgb(0xcf, 0x22, 0x2e)
+    }
 }
 
 /// Streaming text color (mockup's .output default `#c9c9ce`).
+/// Part of the shared palette; BEAT does not draw it yet.
+#[allow(dead_code)]
 pub fn output() -> Color32 {
-    if is_dark() { rgb(0xc9, 0xc9, 0xce) } else { rgb(0x2b, 0x2b, 0x2e) }
+    if is_dark() {
+        rgb(0xc9, 0xc9, 0xce)
+    } else {
+        rgb(0x2b, 0x2b, 0x2e)
+    }
 }
 
 /// Empty-cards placeholder text.
+/// Part of the shared palette; BEAT does not draw it yet.
+#[allow(dead_code)]
 pub fn placeholder() -> Color32 {
-    if is_dark() { rgb(0x4e, 0x4e, 0x56) } else { rgb(0xa8, 0xa8, 0xad) }
+    if is_dark() {
+        rgb(0x4e, 0x4e, 0x56)
+    } else {
+        rgb(0xa8, 0xa8, 0xad)
+    }
 }
 
 /// Statusbar separator dot.
 pub fn status_sep() -> Color32 {
-    if is_dark() { rgb(0x2e, 0x2e, 0x35) } else { rgb(0xc9, 0xc9, 0xc4) }
+    if is_dark() {
+        rgb(0x2e, 0x2e, 0x35)
+    } else {
+        rgb(0xc9, 0xc9, 0xc4)
+    }
 }
 
 // SIL OFL 1.1 (c) Microsoft Corporation, see fonts/OFL-notice.txt
@@ -90,10 +151,8 @@ const BUNDLED_MONO: &[u8] = include_bytes!("../fonts/CascadiaMono-Light.ttf");
 /// glyph nudges; STRIKE reuses the exact same four families.
 fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    let body = egui::FontData::from_static(BUNDLED_MONO).tweak(egui::FontTweak {
-        y_offset_factor: 0.15,
-        ..Default::default()
-    });
+    let body = egui::FontData::from_static(BUNDLED_MONO)
+        .tweak(egui::FontTweak { y_offset_factor: 0.15, ..Default::default() });
     fonts.font_data.insert("mono-system".to_owned(), body);
     for family in [egui::FontFamily::Monospace, egui::FontFamily::Proportional] {
         if let Some(list) = fonts.families.get_mut(&family) {
@@ -118,7 +177,8 @@ fn setup_fonts(ctx: &egui::Context) {
     fonts.families.insert(egui::FontFamily::Name("button".into()), family("mono-button"));
     fonts.font_data.insert(
         "mono-title".to_owned(),
-        egui::FontData::from_static(BUNDLED_MONO).tweak(egui::FontTweak { y_offset_factor: -0.08, ..Default::default() }),
+        egui::FontData::from_static(BUNDLED_MONO)
+            .tweak(egui::FontTweak { y_offset_factor: -0.08, ..Default::default() }),
     );
     fonts.families.insert(egui::FontFamily::Name("title".into()), family("mono-title"));
     fonts.font_data.insert(
@@ -141,10 +201,7 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
         style.spacing.button_padding = egui::vec2(10.0, 8.0);
         style.spacing.interact_size.y = 28.0;
         style.spacing.window_margin = egui::Margin::symmetric(10.0, 15.0);
-        style.spacing.scroll = egui::style::ScrollStyle {
-            foreground_color: true,
-            ..egui::style::ScrollStyle::solid()
-        };
+        style.spacing.scroll = egui::style::ScrollStyle { foreground_color: true, ..egui::style::ScrollStyle::solid() };
         let mut ts = style.text_styles.clone();
         ts.insert(egui::TextStyle::Body, egui::FontId::new(13.0, egui::FontFamily::Proportional));
         ts.insert(egui::TextStyle::Button, egui::FontId::new(12.5, egui::FontFamily::Name("button".into())));
@@ -166,17 +223,29 @@ pub fn set_mode(ctx: &egui::Context, dark: bool) {
 fn terminal_visuals(dark: bool) -> egui::Visuals {
     let (bg, lift, field, line, line2, text, dim, accent, warn, err) = if dark {
         (
-            rgb(0x0b, 0x0b, 0x0e), rgb(0x0e, 0x0e, 0x11), rgb(0x11, 0x11, 0x14),
-            rgb(0x1e, 0x1e, 0x24), rgb(0x33, 0x33, 0x3c),
-            rgb(0xd6, 0xd6, 0xda), rgb(0x83, 0x83, 0x8c),
-            rgb(0x59, 0xd6, 0x8c), rgb(0xe0, 0xb3, 0x4d), rgb(0xe0, 0x65, 0x5c),
+            rgb(0x0b, 0x0b, 0x0e),
+            rgb(0x0e, 0x0e, 0x11),
+            rgb(0x11, 0x11, 0x14),
+            rgb(0x1e, 0x1e, 0x24),
+            rgb(0x33, 0x33, 0x3c),
+            rgb(0xd6, 0xd6, 0xda),
+            rgb(0x83, 0x83, 0x8c),
+            rgb(0x59, 0xd6, 0x8c),
+            rgb(0xe0, 0xb3, 0x4d),
+            rgb(0xe0, 0x65, 0x5c),
         )
     } else {
         (
-            rgb(0xf3, 0xf3, 0xf1), rgb(0xff, 0xff, 0xff), rgb(0xfb, 0xfb, 0xfa),
-            rgb(0xda, 0xda, 0xd6), rgb(0xb5, 0xb5, 0xb0),
-            rgb(0x1c, 0x1c, 0x1e), rgb(0x5c, 0x5c, 0x62),
-            rgb(0x1a, 0x7f, 0x37), rgb(0x9a, 0x67, 0x00), rgb(0xcf, 0x22, 0x2e),
+            rgb(0xf3, 0xf3, 0xf1),
+            rgb(0xff, 0xff, 0xff),
+            rgb(0xfb, 0xfb, 0xfa),
+            rgb(0xda, 0xda, 0xd6),
+            rgb(0xb5, 0xb5, 0xb0),
+            rgb(0x1c, 0x1c, 0x1e),
+            rgb(0x5c, 0x5c, 0x62),
+            rgb(0x1a, 0x7f, 0x37),
+            rgb(0x9a, 0x67, 0x00),
+            rgb(0xcf, 0x22, 0x2e),
         )
     };
 
@@ -237,6 +306,8 @@ pub fn accent_button(text: impl Into<String>) -> egui::Button<'static> {
         .fill(Color32::TRANSPARENT)
 }
 
+/// Part of the shared palette; BEAT does not draw it yet.
+#[allow(dead_code)]
 pub fn danger_button(text: impl Into<String>) -> egui::Button<'static> {
     egui::Button::new(egui::RichText::new(text.into()).color(err()))
         .stroke(egui::Stroke::new(1.0, line2()))
@@ -254,15 +325,17 @@ pub fn field_font() -> egui::FontSelection {
 }
 
 /// Bordered `[prefix value]` chip used by the composer row.
+/// Part of the shared palette; BEAT does not draw it yet.
+#[allow(dead_code)]
 pub fn tag(ui: &mut egui::Ui, prefix: &str, value: &str, value_color: Color32) {
-    egui::Frame::none()
-        .stroke(egui::Stroke::new(1.0, line()))
-        .inner_margin(egui::Margin::symmetric(7.0, 4.0))
-        .show(ui, |ui| {
+    egui::Frame::none().stroke(egui::Stroke::new(1.0, line())).inner_margin(egui::Margin::symmetric(7.0, 4.0)).show(
+        ui,
+        |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             ui.label(egui::RichText::new(prefix).size(11.0).color(dim()));
             ui.label(egui::RichText::new(value).size(11.0).color(value_color));
-        });
+        },
+    );
 }
 
 /// `[ SECTION ]` sidebar caption.
@@ -273,6 +346,8 @@ pub fn section_label(ui: &mut egui::Ui, text: &str) {
 }
 
 /// Hairline row separator that owns exactly 1px of height.
+/// Part of the shared palette; BEAT does not draw it yet.
+#[allow(dead_code)]
 pub fn hline(ui: &mut egui::Ui) {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());

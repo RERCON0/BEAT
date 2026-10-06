@@ -6,3 +6,18 @@
 *.part
 .env
 .env.*
+
+# Written next to config.json (%APPDATA%\beat); listed here so a stray run in
+# the source tree never gets committed.
+/session.json
+/play-stats.json
+/catalog-*.json
+/library-*.json
+/covers/
+*.corrupt-*.bak
+/dist/
+__pycache__/
+*.pyc
+*.pfx
+*.p12
+*-private.pem

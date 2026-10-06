@@ -17,8 +17,7 @@ fn read_state(path: &std::path::Path, cap: u64) -> Result<Option<String>, String
         return Err(format!("файл {path:?} превышает лимит {} МБ", cap / 1024 / 1024));
     }
     let mut bytes = Vec::new();
-    file.take(cap + 1).read_to_end(&mut bytes)
-        .map_err(|e| format!("не удалось прочитать {path:?}: {e}"))?;
+    file.take(cap + 1).read_to_end(&mut bytes).map_err(|e| format!("не удалось прочитать {path:?}: {e}"))?;
     if bytes.len() as u64 > cap {
         return Err(format!("файл {path:?} превышает лимит {} МБ", cap / 1024 / 1024));
     }
@@ -27,8 +26,8 @@ fn read_state(path: &std::path::Path, cap: u64) -> Result<Option<String>, String
 
 pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
-    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| e.to_string())?.as_nanos();
+    let nonce =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
     let temp = path.with_extension(format!("{}.{}.tmp", std::process::id(), nonce));
     let result = (|| -> std::io::Result<()> {
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
@@ -37,40 +36,57 @@ pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), S
         drop(file);
         std::fs::rename(&temp, path)
     })();
-    if result.is_err() { let _ = std::fs::remove_file(&temp); }
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
     result.map_err(|e| format!("не удалось записать {path:?}: {e}"))
 }
 
 /// A corrupt file is set aside so the user can recover instead of having it
 /// silently replaced by defaults on the next save.
 fn backup_corrupt(path: &std::path::Path) -> Option<String> {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let backup = path.with_extension(format!("corrupt-{stamp}.bak"));
-    if backup.exists() { return None; }
+    if backup.exists() {
+        return None;
+    }
     std::fs::rename(path, &backup).ok()?;
     backup.file_name().map(|name| name.to_string_lossy().into_owned())
 }
 
 #[cfg(windows)]
 fn protect_secret(secret: &str) -> Result<String, String> {
-    if secret.is_empty() { return Ok(String::new()); }
+    if secret.is_empty() {
+        return Ok(String::new());
+    }
     let encrypted = dpapi(secret.as_bytes(), true)?;
     let mut out = String::from("dpapi:v1:");
-    for byte in encrypted { out.push_str(&format!("{byte:02x}")); }
+    for byte in encrypted {
+        out.push_str(&format!("{byte:02x}"));
+    }
     Ok(out)
 }
 
+/// Server password on disk.
+///
+/// Windows has DPAPI, which is scoped to the logged-in user. There is no
+/// equivalent built into this crate for other systems, and the previous
+/// fallback wrote the Navidrome password to `config.json` in cleartext — so
+/// instead of storing it, saving reports that it was left out. The user types
+/// it again after a restart; every other setting still persists.
 #[cfg(not(windows))]
-fn protect_secret(secret: &str) -> Result<String, String> { Ok(secret.to_owned()) }
+fn protect_secret(_secret: &str) -> Result<String, String> {
+    Err("на этой платформе пароль нельзя сохранить безопасно".into())
+}
 
 #[cfg(windows)]
 fn unprotect_secret(stored: &str) -> Result<String, String> {
     let hex = stored.strip_prefix("dpapi:v1:").ok_or("неизвестный формат пароля")?;
-    if hex.len() % 2 != 0 || !hex.is_ascii() { return Err("повреждённый пароль".into()); }
-    let bytes = hex.as_bytes()
+    if hex.len() % 2 != 0 || !hex.is_ascii() {
+        return Err("повреждённый пароль".into());
+    }
+    let bytes = hex
+        .as_bytes()
         .chunks_exact(2)
         .map(|pair| {
             let pair = std::str::from_utf8(pair).map_err(|_| "повреждённый пароль".to_string())?;
@@ -89,37 +105,78 @@ fn unprotect_secret(_stored: &str) -> Result<String, String> {
 fn dpapi(input: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
     use std::ffi::c_void;
     #[repr(C)]
-    struct DataBlob { size: u32, data: *mut u8 }
+    struct DataBlob {
+        size: u32,
+        data: *mut u8,
+    }
     #[link(name = "Crypt32")]
-    extern "system" {
-        fn CryptProtectData(input: *const DataBlob, description: *const u16,
-            entropy: *const DataBlob, reserved: *mut c_void, prompt: *const c_void,
-            flags: u32, output: *mut DataBlob) -> i32;
-        fn CryptUnprotectData(input: *const DataBlob, description: *mut *mut u16,
-            entropy: *const DataBlob, reserved: *mut c_void, prompt: *const c_void,
-            flags: u32, output: *mut DataBlob) -> i32;
+    unsafe extern "system" {
+        fn CryptProtectData(
+            input: *const DataBlob,
+            description: *const u16,
+            entropy: *const DataBlob,
+            reserved: *mut c_void,
+            prompt: *const c_void,
+            flags: u32,
+            output: *mut DataBlob,
+        ) -> i32;
+        fn CryptUnprotectData(
+            input: *const DataBlob,
+            description: *mut *mut u16,
+            entropy: *const DataBlob,
+            reserved: *mut c_void,
+            prompt: *const c_void,
+            flags: u32,
+            output: *mut DataBlob,
+        ) -> i32;
     }
     #[link(name = "Kernel32")]
-    extern "system" { fn LocalFree(memory: *mut c_void) -> *mut c_void; }
+    unsafe extern "system" {
+        fn LocalFree(memory: *mut c_void) -> *mut c_void;
+    }
     let size = u32::try_from(input.len()).map_err(|_| "пароль слишком длинный".to_string())?;
     let source = DataBlob { size, data: input.as_ptr() as *mut u8 };
     let mut output = DataBlob { size: 0, data: std::ptr::null_mut() };
     // DPAPI is scoped to the current Windows user. UI prompts are disabled.
     let ok = unsafe {
         if encrypt {
-            CryptProtectData(&source, std::ptr::null(), std::ptr::null(), std::ptr::null_mut(),
-                std::ptr::null(), 1, &mut output)
+            CryptProtectData(
+                &source,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                1,
+                &mut output,
+            )
         } else {
-            CryptUnprotectData(&source, std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut(),
-                std::ptr::null(), 1, &mut output)
+            CryptUnprotectData(
+                &source,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                1,
+                &mut output,
+            )
         }
     };
-    if ok == 0 { return Err(format!("защита пароля Windows: {}", std::io::Error::last_os_error())); }
-    if output.data.is_null() && output.size != 0 { return Err("повреждённый ответ Windows DPAPI".into()); }
-    let bytes = if output.size == 0 { Vec::new() } else {
+    if ok == 0 {
+        return Err(format!("защита пароля Windows: {}", std::io::Error::last_os_error()));
+    }
+    if output.data.is_null() && output.size != 0 {
+        return Err("повреждённый ответ Windows DPAPI".into());
+    }
+    let bytes = if output.size == 0 {
+        Vec::new()
+    } else {
         unsafe { std::slice::from_raw_parts(output.data, output.size as usize).to_vec() }
     };
-    if !output.data.is_null() { unsafe { LocalFree(output.data.cast()); } }
+    if !output.data.is_null() {
+        unsafe {
+            LocalFree(output.data.cast());
+        }
+    }
     Ok(bytes)
 }
 
@@ -141,10 +198,18 @@ impl StreamFormat {
     }
 }
 
-fn default_format() -> StreamFormat { StreamFormat::Raw }
-fn default_bit_rate() -> u32 { 320 }
-fn default_volume() -> f32 { 0.8 }
-fn default_true() -> bool { true }
+fn default_format() -> StreamFormat {
+    StreamFormat::Raw
+}
+fn default_bit_rate() -> u32 {
+    320
+}
+fn default_volume() -> f32 {
+    0.8
+}
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -184,7 +249,9 @@ pub struct Config {
     pub save_blocked: bool,
 }
 
-fn default_parallel() -> usize { 3 }
+fn default_parallel() -> usize {
+    3
+}
 
 /// Keeps the first `max` characters; `String::truncate` takes a byte index
 /// and panics inside a multi-byte character.
@@ -217,7 +284,9 @@ impl Default for Config {
 impl Config {
     pub fn sanitize(&mut self) {
         self.parallel_downloads = self.parallel_downloads.clamp(1, 3);
-        if !self.volume.is_finite() { self.volume = 0.8; }
+        if !self.volume.is_finite() {
+            self.volume = 0.8;
+        }
         self.volume = self.volume.clamp(0.0, 1.0);
         self.bit_rate = self.bit_rate.min(320);
         truncate_chars(&mut self.server_url, 500);
@@ -226,9 +295,7 @@ impl Config {
 
     pub fn cache_root(&self) -> PathBuf {
         if self.cache_dir.trim().is_empty() {
-            music_dir()
-                .map(|music| music.join("BEAT"))
-                .unwrap_or_else(|| config_path().with_file_name("cache"))
+            music_dir().map(|music| music.join("BEAT")).unwrap_or_else(|| config_path().with_file_name("cache"))
         } else {
             PathBuf::from(self.cache_dir.trim())
         }
@@ -252,8 +319,11 @@ impl Config {
                 }
             },
             Ok(None) => Config::default(),
-            Err(err) => Config { warning: Some(format!("{err}; сохранение заблокировано")),
-                save_blocked: true, ..Config::default() },
+            Err(err) => Config {
+                warning: Some(format!("{err}; сохранение заблокировано")),
+                save_blocked: true,
+                ..Config::default()
+            },
         };
         cfg.sanitize();
         #[cfg(windows)]
@@ -264,7 +334,8 @@ impl Config {
                 Err(_) => {
                     cfg.unreadable_password = Some(cfg.password.clone());
                     cfg.password.clear();
-                    cfg.warning = Some("пароль сервера не удалось расшифровать; введите его заново в настройках".into());
+                    cfg.warning =
+                        Some("пароль сервера не удалось расшифровать; введите его заново в настройках".into());
                 }
             }
         }
@@ -277,22 +348,32 @@ impl Config {
         cfg
     }
 
-    pub fn save(&self) -> Result<(), String> {
+    pub fn save(&mut self) -> Result<(), String> {
         self.save_to(&config_path())
     }
 
-    fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
+    fn save_to(&mut self, path: &std::path::Path) -> Result<(), String> {
         if self.save_blocked {
             return Err("config.json не был прочитан; сохранение заблокировано во избежание потери данных".into());
         }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("не удалось создать {dir:?}: {e}"))?;
         }
+        self.warning = None;
         let mut disk = self.clone();
         disk.password = if self.password.is_empty() {
             self.unreadable_password.clone().unwrap_or_default()
         } else {
-            protect_secret(&self.password)?
+            match protect_secret(&self.password) {
+                Ok(stored) => stored,
+                Err(err) => {
+                    // Nothing is written for the password rather than writing it
+                    // unprotected: every other setting still persists, and the
+                    // UI says why the field will be empty after a restart.
+                    self.warning = Some(format!("пароль не сохранён: {err}"));
+                    String::new()
+                }
+            }
         };
         let raw = serde_json::to_vec_pretty(&disk).map_err(|e| e.to_string())?;
         if raw.len() as u64 > MAX_CONFIG_BYTES {
@@ -335,11 +416,11 @@ pub fn music_dir() -> Option<PathBuf> {
         data4: [0xBE, 0x97, 0x42, 0x22, 0x20, 0x08, 0x0E, 0x43],
     };
     #[link(name = "Shell32")]
-    extern "system" {
+    unsafe extern "system" {
         fn SHGetKnownFolderPath(rfid: *const Guid, flags: u32, token: *mut c_void, path: *mut *mut u16) -> i32;
     }
     #[link(name = "Ole32")]
-    extern "system" {
+    unsafe extern "system" {
         fn CoTaskMemFree(memory: *mut c_void);
     }
     unsafe {
@@ -399,8 +480,11 @@ mod tests {
     fn sanitize_truncates_long_multibyte_values_without_panicking() {
         // Byte 500 falls inside a two-byte letter: a byte-index truncate panics,
         // and a config that panics on load keeps the app from ever starting.
-        let mut cfg = Config { cache_dir: format!("a{}", "я".repeat(600)),
-            server_url: format!("https://{}", "я".repeat(600)), ..Config::default() };
+        let mut cfg = Config {
+            cache_dir: format!("a{}", "я".repeat(600)),
+            server_url: format!("https://{}", "я".repeat(600)),
+            ..Config::default()
+        };
         cfg.sanitize();
         assert_eq!(cfg.cache_dir.chars().count(), 500);
         assert_eq!(cfg.server_url.chars().count(), 500);
@@ -419,9 +503,11 @@ mod tests {
 
     #[test]
     fn oversized_config_write_is_refused() {
-        let path = std::env::temp_dir().join(format!("beat-oversize-{}-{}.json",
-            std::process::id(), std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let path = std::env::temp_dir().join(format!(
+            "beat-oversize-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
         let mut cfg = Config { server_url: format!("https://{}", "x".repeat(2 * 1024 * 1024)), ..Config::default() };
         cfg.save_blocked = true;
         assert!(cfg.save_to(&path).is_err());
@@ -431,6 +517,50 @@ mod tests {
         cfg.server_url = "https://music.example".into();
         cfg.save_to(&path).unwrap();
         assert!(path.exists());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn the_password_never_lands_in_the_file_in_cleartext() {
+        // Whatever the platform, config.json must never contain the Navidrome
+        // password verbatim: DPAPI on Windows, not stored at all elsewhere.
+        let path = std::env::temp_dir().join(format!(
+            "beat-secret-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut cfg = Config {
+            server_url: "https://music.example".into(),
+            user: "me".into(),
+            password: "hunter2".into(),
+            ..Config::default()
+        };
+        cfg.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("hunter2"), "the password was stored unprotected: {raw}");
+        // The rest of the settings survive.
+        let back: Config = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back.server_url, "https://music.example");
+        assert_eq!(back.user, "me");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn without_dpapi_the_password_is_dropped_with_a_warning() {
+        let path = std::env::temp_dir().join(format!(
+            "beat-nosecret-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut cfg = Config { password: "hunter2".into(), volume: 0.5, ..Config::default() };
+        cfg.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("hunter2"), "{raw}");
+        assert!(cfg.warning.as_deref().is_some_and(|w| w.contains("пароль не сохранён")), "{:?}", cfg.warning);
+        let back: Config = serde_json::from_str(&raw).unwrap();
+        assert!(back.password.is_empty());
+        assert_eq!(back.volume, 0.5);
         std::fs::remove_file(path).unwrap();
     }
 

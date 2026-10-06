@@ -14,6 +14,20 @@ const MAX_FILES: usize = 3000;
 const MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const PRUNE_EVERY: usize = 64;
+/// Nothing bigger than this is ever written here, so a bigger file is a corrupt
+/// or planted one and must not be expanded into memory first.
+const MAX_STORED_SIDE: u32 = 1024;
+
+/// Decoder limits for the cached thumbnails. The network/embedded path sets its
+/// own (`main::cover_limits`); without them a small PNG in this folder could
+/// allocate gigabytes before the size check below ever ran.
+fn cache_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_STORED_SIDE);
+    limits.max_image_height = Some(MAX_STORED_SIDE);
+    limits.max_alloc = Some(MAX_STORED_SIDE as u64 * MAX_STORED_SIDE as u64 * 4);
+    limits
+}
 
 static STORED: AtomicUsize = AtomicUsize::new(0);
 
@@ -26,7 +40,9 @@ fn file_for(dir: &Path, key: &str) -> PathBuf {
     hasher.update(key.as_bytes());
     let digest = hasher.finalize();
     let mut name = String::with_capacity(32);
-    for byte in digest { name.push_str(&format!("{byte:02x}")); }
+    for byte in digest {
+        name.push_str(&format!("{byte:02x}"));
+    }
     dir.join(format!("{name}.png"))
 }
 
@@ -34,7 +50,9 @@ fn file_for(dir: &Path, key: &str) -> PathBuf {
 /// changes (size or modification time).
 pub fn file_key(rel: &str, path: &Path, px: u32) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
-    let mtime = meta.modified().ok()
+    let mtime = meta
+        .modified()
+        .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .unwrap_or(0);
@@ -55,12 +73,20 @@ pub fn load_in(dir: &Path, key: &str) -> Option<ColorImage> {
     let path = file_for(dir, key);
     guarded(|| {
         let meta = std::fs::metadata(&path).ok()?;
-        if meta.len() > MAX_FILE_BYTES { return None; }
+        if meta.len() > MAX_FILE_BYTES {
+            return None;
+        }
         let bytes = std::fs::read(&path).ok()?;
-        let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).ok()?.to_rgba8();
+        let mut reader = image::ImageReader::with_format(std::io::Cursor::new(&bytes), image::ImageFormat::Png);
+        reader.limits(cache_limits());
+        let decoded = reader.decode().ok()?.to_rgba8();
         let (width, height) = decoded.dimensions();
-        if width == 0 || height == 0 || width > 1024 || height > 1024 { return None; }
-        let pixels = decoded.as_raw().chunks_exact(4)
+        if width == 0 || height == 0 || width > MAX_STORED_SIDE || height > MAX_STORED_SIDE {
+            return None;
+        }
+        let pixels = decoded
+            .as_raw()
+            .chunks_exact(4)
             .map(|p| egui::Color32::from_rgba_premultiplied(p[0], p[1], p[2], p[3]))
             .collect();
         Some(ColorImage { size: [width as usize, height as usize], pixels })
@@ -73,7 +99,7 @@ pub fn store(key: &str, image: &ColorImage) -> Option<PathBuf> {
     let dir = dir();
     let path = store_in(&dir, key, image)?;
     // The directory listing is throttled: one check every few stores.
-    if STORED.fetch_add(1, Ordering::Relaxed) % PRUNE_EVERY == 0 {
+    if STORED.fetch_add(1, Ordering::Relaxed).is_multiple_of(PRUNE_EVERY) {
         prune(&dir);
     }
     Some(path)
@@ -81,7 +107,9 @@ pub fn store(key: &str, image: &ColorImage) -> Option<PathBuf> {
 
 pub fn store_in(dir: &Path, key: &str, image: &ColorImage) -> Option<PathBuf> {
     let (width, height) = (image.size[0], image.size[1]);
-    if width == 0 || height == 0 || width > 1024 || height > 1024 { return None; }
+    if width == 0 || height == 0 || width as u32 > MAX_STORED_SIDE || height as u32 > MAX_STORED_SIDE {
+        return None;
+    }
     guarded(|| {
         let raw = image.as_raw().to_vec();
         let rgba = image::RgbaImage::from_raw(width as u32, height as u32, raw)?;
@@ -103,10 +131,13 @@ pub fn prune(dir: &Path) {
 
 fn prune_to(dir: &Path, max_files: usize, max_bytes: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries.flatten()
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
+        .flatten()
         .filter_map(|entry| {
             let meta = entry.metadata().ok()?;
-            if !meta.is_file() { return None; }
+            if !meta.is_file() {
+                return None;
+            }
             let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             Some((modified, meta.len(), entry.path()))
         })
@@ -123,7 +154,9 @@ fn prune_to(dir: &Path, max_files: usize, max_bytes: u64) {
     let mut kept_bytes = total;
     let mut remove = 0usize;
     for (_, len, _) in &files {
-        if kept <= file_budget && kept_bytes <= byte_budget { break; }
+        if kept <= file_budget && kept_bytes <= byte_budget {
+            break;
+        }
         kept -= 1;
         kept_bytes = kept_bytes.saturating_sub(*len);
         remove += 1;
@@ -147,8 +180,11 @@ mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("beat-covers-{tag}-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()))
+        std::env::temp_dir().join(format!(
+            "beat-covers-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ))
     }
 
     #[test]
@@ -181,6 +217,23 @@ mod tests {
     }
 
     #[test]
+    fn the_cached_decoder_is_bounded_before_it_allocates() {
+        // A crafted PNG in the covers folder must not be expanded into memory
+        // first: the limits have to be on the reader, not only on the result.
+        let limits = cache_limits();
+        assert_eq!(limits.max_image_width, Some(MAX_STORED_SIDE));
+        assert_eq!(limits.max_image_height, Some(MAX_STORED_SIDE));
+        assert_eq!(limits.max_alloc, Some(1024 * 1024 * 4));
+        // A normal thumbnail still loads through the bounded reader.
+        let dir = temp_dir("bounded");
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = ColorImage::from_rgba_unmultiplied([4, 4], &[7u8; 4 * 4 * 4]);
+        store_in(&dir, "k", &image).unwrap();
+        assert_eq!(load_in(&dir, "k").map(|loaded| loaded.size), Some([4, 4]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn pruning_keeps_the_newest_thumbnails() {
         let dir = temp_dir("prune");
         std::fs::create_dir_all(&dir).unwrap();
@@ -189,7 +242,9 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(15));
         }
         prune_to(&dir, 3, u64::MAX);
-        let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten()
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
@@ -207,7 +262,9 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(15));
         }
         prune_to(&dir, usize::MAX, 300);
-        let total: u64 = std::fs::read_dir(&dir).unwrap().flatten()
+        let total: u64 = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
             .filter_map(|entry| entry.metadata().ok())
             .map(|meta| meta.len())
             .sum();

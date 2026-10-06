@@ -62,6 +62,14 @@ pub fn load_from(path: &Path) -> Session {
             if session.song.as_ref().is_some_and(|song| song.id.is_empty()) {
                 session.song = None;
             }
+            // A long queue is stored as a window around the current track. If the
+            // two ever disagree (an older file, a hand edit), the current song
+            // would be unreachable: "next" would run off the end of the queue
+            // and clear it. The queue index already points at the right track,
+            // so dropping the orphan is the safe half.
+            if session.song.as_ref().is_some_and(|song| !session.queue.iter().any(|queued| queued.id == song.id)) {
+                session.song = None;
+            }
             session
         }
         Err(_) => {
@@ -87,8 +95,14 @@ pub fn save_to(path: &Path, session: &Session) -> Result<(), String> {
         repeat: Repeat,
     }
     let bytes = serde_json::to_vec(&Ref {
-        version: 1, song: &session.song, queue: &queue, index, shuffle: session.shuffle, repeat: session.repeat,
-    }).map_err(|e| format!("не удалось сохранить сессию: {e}"))?;
+        version: 1,
+        song: &session.song,
+        queue: &queue,
+        index,
+        shuffle: session.shuffle,
+        repeat: session.repeat,
+    })
+    .map_err(|e| format!("не удалось сохранить сессию: {e}"))?;
     if bytes.len() as u64 > MAX_BYTES {
         return Err("сессия слишком большая; прежний файл не заменён".into());
     }
@@ -127,10 +141,7 @@ fn read_capped(path: &Path) -> Result<Option<Vec<u8>>, ()> {
 
 /// Renames a broken file out of the way; a taken name stays as is.
 fn set_aside(path: &Path) {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let backup = path.with_extension(format!("corrupt-{stamp}.bak"));
     if backup.exists() {
         return;
@@ -143,12 +154,17 @@ mod tests {
     use super::*;
 
     fn temp_path(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("beat-session-{tag}-{}-{}/session.json", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()))
+        std::env::temp_dir().join(format!(
+            "beat-session-{tag}-{}-{}/session.json",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ))
     }
 
     fn songs(count: usize) -> Vec<Song> {
-        (0..count).map(|index| Song { id: format!("s{index}"), title: format!("T{index}"), ..Song::default() }).collect()
+        (0..count)
+            .map(|index| Song { id: format!("s{index}"), title: format!("T{index}"), ..Song::default() })
+            .collect()
     }
 
     #[test]
@@ -183,6 +199,33 @@ mod tests {
     }
 
     #[test]
+    fn a_current_song_outside_the_stored_queue_is_dropped() {
+        // A long queue is saved as a window; if the saved `song` is not in it,
+        // «next» would run off the end of the queue and clear it. The index
+        // already points at the right track, so the orphan goes.
+        let path = temp_path("orphan");
+        let queue = songs(50);
+        let raw = format!(
+            r#"{{"version":1,"song":{{"id":"not-in-queue","title":"Orphan"}},"queue":[{}],"index":7,"shuffle":false,"repeat":"off"}}"#,
+            queue.iter().map(|song| format!(r#"{{"id":"{}","title":"T"}}"#, song.id)).collect::<Vec<_>>().join(",")
+        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, raw).unwrap();
+        let loaded = load_from(&path);
+        assert!(loaded.song.is_none(), "an unreachable current song was restored");
+        assert_eq!(loaded.queue.len(), 50);
+        assert_eq!(loaded.index, 7);
+        // The normal case keeps both.
+        let mut session =
+            Session { song: Some(queue[7].clone()), queue, index: 7, shuffle: false, repeat: Repeat::Off };
+        session.song = Some(session.queue[session.index].clone());
+        save_to(&path, &session).unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.song.map(|song| song.id), Some("s7".into()));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn a_corrupt_session_is_set_aside_and_never_blocks_startup() {
         let path = temp_path("corrupt");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -190,7 +233,9 @@ mod tests {
         let loaded = load_from(&path);
         assert!(loaded.song.is_none() && loaded.queue.is_empty());
         assert!(!path.exists());
-        let backup = std::fs::read_dir(path.parent().unwrap()).unwrap().flatten()
+        let backup = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
             .any(|entry| entry.file_name().to_string_lossy().contains("corrupt"));
         assert!(backup, "no backup was kept for the damaged session");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

@@ -23,6 +23,66 @@ pub const LOCAL_ID_PREFIX: &str = "local:";
 const AUDIO_EXTS: [&str; 8] = ["mp3", "flac", "ogg", "oga", "wav", "m4a", "aac", "mp4"];
 const MAX_DEPTH: usize = 8;
 const MAX_TRACKS: usize = 5000;
+/// How much of a hand-dropped file tag probing may read. Real tracks are far
+/// below this (it is about three hours of 320 kbps), but nothing capped the
+/// read before: a huge or hostile file in the cache folder was parsed end to
+/// end by symphonia, twice, on every rescan that saw it change.
+const MAX_PROBE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The first `MAX_PROBE_BYTES` of a file, as a symphonia `MediaSource`. Seeking
+/// past the end reports the limit instead of the real length, so the format
+/// probe still sees a consistent stream — and tags, which live at the front,
+/// are unaffected.
+struct ProbeSource {
+    file: std::fs::File,
+    pos: u64,
+    size: u64,
+}
+
+impl ProbeSource {
+    fn new(path: &Path) -> Option<Self> {
+        let file = std::fs::File::open(path).ok()?;
+        let size = file.metadata().ok()?.len().min(MAX_PROBE_BYTES);
+        Some(Self { file, pos: 0, size })
+    }
+}
+
+impl std::io::Read for ProbeSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::{Seek, SeekFrom};
+        if self.pos >= self.size {
+            return Ok(0);
+        }
+        let want = (self.size - self.pos).min(buf.len() as u64) as usize;
+        self.file.seek(SeekFrom::Start(self.pos))?;
+        let read = self.file.read(&mut buf[..want])?;
+        self.pos += read as u64;
+        Ok(read)
+    }
+}
+
+impl std::io::Seek for ProbeSource {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        use std::io::SeekFrom;
+        let target = match from {
+            SeekFrom::Start(pos) => pos as i128,
+            SeekFrom::Current(offset) => self.pos as i128 + i128::from(offset),
+            SeekFrom::End(offset) => self.size as i128 + i128::from(offset),
+        };
+        let clamped = target.clamp(0, self.size as i128) as u64;
+        self.pos = clamped;
+        Ok(clamped)
+    }
+}
+
+impl symphonia::core::io::MediaSource for ProbeSource {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+    fn byte_len(&self) -> Option<u64> {
+        Some(self.size)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct LocalTrack {
@@ -75,7 +135,7 @@ pub fn scan_with(root: &Path, excluded: &HashSet<String>, cache: &ProbeCache) ->
     // A long-running app may see arbitrarily many replaced/deleted files;
     // retain only probes for files still present in this scan.
     let present: HashSet<&str> = tracks.iter().map(|track| track.rel.as_str()).collect();
-    cache.entries.lock().unwrap().retain(|rel, _| present.contains(rel.as_str()));
+    crate::lock(&cache.entries).retain(|rel, _| present.contains(rel.as_str()));
     tracks.sort_by(|a, b| a.rel.to_lowercase().cmp(&b.rel.to_lowercase()));
     tracks
 }
@@ -106,25 +166,38 @@ impl ProbeCache {
     /// The tags of `path`: from the cache while `size` and `modified` still
     /// match, otherwise read from the file.
     fn probe(&self, rel: &str, path: &Path, size: u64, modified: Option<SystemTime>) -> Probe {
-        if let Some(cached) = self.entries.lock().unwrap().get(rel) {
+        if let Some(cached) = crate::lock(&self.entries).get(rel) {
             if cached.size == size && cached.modified == modified {
                 return cached.probe.clone();
             }
         }
         let probe = probe_file(path);
         self.probed.fetch_add(1, Ordering::SeqCst);
-        self.entries.lock().unwrap().insert(rel.to_owned(), ProbedFile { size, modified, probe: probe.clone() });
+        crate::lock(&self.entries).insert(rel.to_owned(), ProbedFile { size, modified, probe: probe.clone() });
         probe
     }
 }
 
-fn walk(root: &Path, dir: &Path, depth: usize, excluded: &HashSet<String>, cache: &ProbeCache, tracks: &mut Vec<LocalTrack>) {
-    if depth > MAX_DEPTH || tracks.len() >= MAX_TRACKS { return; }
+fn walk(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    excluded: &HashSet<String>,
+    cache: &ProbeCache,
+    tracks: &mut Vec<LocalTrack>,
+) {
+    if depth > MAX_DEPTH || tracks.len() >= MAX_TRACKS {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
-        if tracks.len() >= MAX_TRACKS { return; }
+        if tracks.len() >= MAX_TRACKS {
+            return;
+        }
         let Ok(kind) = entry.file_type() else { continue };
-        if linked(&entry.path()) { continue; }
+        if linked(&entry.path()) {
+            continue;
+        }
         if kind.is_dir() {
             walk(root, &entry.path(), depth + 1, excluded, cache, tracks);
         } else if kind.is_file() {
@@ -137,16 +210,28 @@ fn walk(root: &Path, dir: &Path, depth: usize, excluded: &HashSet<String>, cache
 
 /// Cheap filter shared by the full scan and the counting walk: is this path a
 /// playable, not-yet-indexed file? Returns (relative path, suffix, size, mtime).
-fn audio_file(root: &Path, path: &Path, excluded: &HashSet<String>) -> Option<(String, String, u64, Option<SystemTime>)> {
+fn audio_file(
+    root: &Path,
+    path: &Path,
+    excluded: &HashSet<String>,
+) -> Option<(String, String, u64, Option<SystemTime>)> {
     let name = path.file_name()?.to_str()?;
-    if name.starts_with('.') { return None; }
+    if name.starts_with('.') {
+        return None;
+    }
     let suffix = path.extension()?.to_str()?.to_ascii_lowercase();
-    if !AUDIO_EXTS.contains(&suffix.as_str()) { return None; }
+    if !AUDIO_EXTS.contains(&suffix.as_str()) {
+        return None;
+    }
     let rel = path.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/");
-    if rel.is_empty() || excluded.contains(&rel) { return None; }
+    if rel.is_empty() || excluded.contains(&rel) {
+        return None;
+    }
     let metadata = std::fs::metadata(path).ok()?;
     let size = metadata.len();
-    if size == 0 { return None; }
+    if size == 0 {
+        return None;
+    }
     Some((rel, suffix, size, metadata.modified().ok()))
 }
 
@@ -159,12 +244,18 @@ pub fn count(root: &Path, excluded: &HashSet<String>) -> (usize, u64) {
 }
 
 fn count_walk(root: &Path, dir: &Path, depth: usize, excluded: &HashSet<String>, stats: &mut (usize, u64)) {
-    if depth > MAX_DEPTH || stats.0 >= MAX_TRACKS { return; }
+    if depth > MAX_DEPTH || stats.0 >= MAX_TRACKS {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
-        if stats.0 >= MAX_TRACKS { return; }
+        if stats.0 >= MAX_TRACKS {
+            return;
+        }
         let Ok(kind) = entry.file_type() else { continue };
-        if linked(&entry.path()) { continue; }
+        if linked(&entry.path()) {
+            continue;
+        }
         if kind.is_dir() {
             count_walk(root, &entry.path(), depth + 1, excluded, stats);
         } else if kind.is_file() {
@@ -178,11 +269,15 @@ fn count_walk(root: &Path, dir: &Path, depth: usize, excluded: &HashSet<String>,
 
 fn linked(path: &Path) -> bool {
     let Ok(meta) = std::fs::symlink_metadata(path) else { return true };
-    if meta.file_type().is_symlink() { return true; }
+    if meta.file_type().is_symlink() {
+        return true;
+    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        if meta.file_attributes() & 0x400 != 0 { return true; } // Windows junction/reparse point
+        if meta.file_attributes() & 0x400 != 0 {
+            return true;
+        } // Windows junction/reparse point
     }
     false
 }
@@ -192,9 +287,7 @@ fn track_for(root: &Path, path: &Path, excluded: &HashSet<String>, cache: &Probe
     let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
     let (file_artist, file_title) = split_title(stem);
     let probed = cache.probe(&rel, path, size, modified);
-    let title = probed.title.unwrap_or_else(|| {
-        if file_title.trim().is_empty() { stem.to_owned() } else { file_title }
-    });
+    let title = probed.title.unwrap_or_else(|| if file_title.trim().is_empty() { stem.to_owned() } else { file_title });
     let artist = probed.artist.unwrap_or(file_artist);
     let album = probed.album.unwrap_or_else(|| {
         path.parent()
@@ -234,11 +327,17 @@ fn split_title(stem: &str) -> (String, String) {
 
 fn strip_track_number(raw: &str) -> &str {
     let digits = raw.chars().take_while(|c| c.is_ascii_digit()).count();
-    if digits == 0 || digits > 3 || digits == raw.chars().count() { return raw; }
+    if digits == 0 || digits > 3 || digits == raw.chars().count() {
+        return raw;
+    }
     let rest = raw[digits..].trim_start();
     let Some(rest) = rest.strip_prefix(['.', '-', ')']) else { return raw };
     let rest = rest.trim_start();
-    if rest.is_empty() { raw } else { rest }
+    if rest.is_empty() {
+        raw
+    } else {
+        rest
+    }
 }
 
 #[derive(Default, Clone)]
@@ -260,14 +359,13 @@ fn probe_file(path: &Path) -> Probe {
 }
 
 fn probe_format(path: &Path) -> Option<ProbeResult> {
-    let file = open(path)?;
-    let stream = MediaSourceStream::new(Box::new(file), Default::default());
+    let source = ProbeSource::new(path)?;
+    let stream = MediaSourceStream::new(Box::new(source), Default::default());
     let mut hint = Hint::new();
     if let Some(extension) = path.extension().and_then(|ext| ext.to_str()) {
         hint.with_extension(extension);
     }
-    symphonia::default::get_probe()
-        .format(&hint, stream, &Default::default(), &Default::default()).ok()
+    symphonia::default::get_probe().format(&hint, stream, &Default::default(), &Default::default()).ok()
 }
 
 /// Embedded artwork of a file (front cover preferred), for the on-disk list
@@ -297,10 +395,13 @@ fn embedded_cover_inner(path: &Path) -> Option<Vec<u8>> {
 }
 
 fn pick_visual(visuals: &[Visual], max_bytes: usize) -> Option<Vec<u8>> {
-    let visual = visuals.iter()
+    let visual = visuals
+        .iter()
         .find(|visual| visual.usage == Some(StandardVisualKey::FrontCover))
         .or_else(|| visuals.first())?;
-    if visual.data.is_empty() || visual.data.len() > max_bytes { return None; }
+    if visual.data.is_empty() || visual.data.len() > max_bytes {
+        return None;
+    }
     Some(visual.data.to_vec())
 }
 
@@ -322,17 +423,17 @@ fn probe(path: &Path) -> Probe {
     // MP3 without a Xing header has no frame count until decoded; rodio's
     // decoder derives the duration from the byte length instead.
     if probe.duration <= 0.0 {
-        if let Some(file) = open(path) {
-            if let Ok(decoder) = rodio::Decoder::try_from(file) {
+        if let Some(source) = ProbeSource::new(path) {
+            let stream = MediaSourceStream::new(Box::new(source), Default::default());
+            if let Ok(decoder) = rodio::Decoder::new(stream) {
                 if let Some(duration) = rodio::Source::total_duration(&decoder) {
                     probe.duration = duration.as_secs_f64();
                 }
             }
         }
     }
-    probe.duration = if probe.duration.is_finite() {
-        probe.duration.clamp(0.0, crate::api::MAX_DURATION_SECS)
-    } else { 0.0 };
+    probe.duration =
+        if probe.duration.is_finite() { probe.duration.clamp(0.0, crate::api::MAX_DURATION_SECS) } else { 0.0 };
     probe
 }
 
@@ -352,7 +453,9 @@ fn collect_tags(tags: &[Tag], probe: &mut Probe) {
     for tag in tags {
         let Value::String(value) = &tag.value else { continue };
         let value = value.trim();
-        if value.is_empty() { continue; }
+        if value.is_empty() {
+            continue;
+        }
         match tag.std_key {
             Some(StandardTagKey::TrackTitle) if probe.title.is_none() => probe.title = Some(value.to_owned()),
             Some(StandardTagKey::Artist) if probe.artist.is_none() => probe.artist = Some(value.to_owned()),
@@ -362,17 +465,16 @@ fn collect_tags(tags: &[Tag], probe: &mut Probe) {
     }
 }
 
-fn open(path: &Path) -> Option<std::fs::File> {
-    std::fs::File::open(path).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("beat-{tag}-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()))
+        std::env::temp_dir().join(format!(
+            "beat-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ))
     }
 
     #[test]
@@ -422,7 +524,7 @@ mod tests {
         assert_eq!(second[0].duration, first[0].duration);
         std::fs::remove_file(root.join("b.wav")).unwrap();
         scan_with(&root, &HashSet::new(), &cache);
-        assert_eq!(cache.entries.lock().unwrap().len(), 1, "deleted files must leave the probe cache");
+        assert_eq!(crate::lock(&cache.entries).len(), 1, "deleted files must leave the probe cache");
         // A file that changed (new size) is read again and shows the new length.
         write_wav(&root.join("a.wav"), 2);
         let third = scan_with(&root, &HashSet::new(), &cache);
@@ -430,6 +532,39 @@ mod tests {
         let changed = third.iter().find(|track| track.rel == "a.wav").unwrap();
         assert!((changed.duration - 2.0).abs() < 0.1, "duration {}", changed.duration);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn probing_stops_at_the_read_ceiling() {
+        // A huge hand-dropped file must not be parsed end to end on every
+        // rescan; the source reports the ceiling as its length instead.
+        let path = std::env::temp_dir().join(format!(
+            "beat-probe-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(&path, vec![7u8; 4096]).unwrap();
+        let source = ProbeSource::new(&path).expect("the file opens");
+        assert_eq!(source.size, 4096);
+        assert_eq!(symphonia::core::io::MediaSource::byte_len(&source), Some(4096));
+        let mut limited = ProbeSource { file: source.file, pos: 0, size: 1024 };
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut limited, &mut buf).unwrap();
+        assert_eq!(buf.len(), 1024, "read past the ceiling");
+        // Seeking beyond the ceiling clamps to it instead of failing.
+        use std::io::Seek;
+        assert_eq!(limited.seek(std::io::SeekFrom::Start(99_999)).unwrap(), 1024);
+        assert_eq!(limited.seek(std::io::SeekFrom::End(10)).unwrap(), 1024);
+        assert_eq!(limited.seek(std::io::SeekFrom::Current(-50)).unwrap(), 974);
+        assert_eq!(limited.seek(std::io::SeekFrom::Start(5)).unwrap(), 5);
+        // And a real file still probes normally.
+        let real_dir = temp_dir("probe-ceiling-real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real = real_dir.join("a.wav");
+        write_wav(&real, 1);
+        assert!(probe_format(&real).is_some(), "a normal file stopped probing");
+        let _ = std::fs::remove_dir_all(&real_dir);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -513,9 +648,15 @@ mod tests {
     #[test]
     fn local_tracks_become_playable_songs() {
         let track = LocalTrack {
-            id: "local:a/b.mp3".into(), path: PathBuf::from("x"), rel: "a/b.mp3".into(),
-            title: "T".into(), artist: "A".into(), album: "B".into(),
-            duration: 12.0, suffix: "mp3".into(), size: 1,
+            id: "local:a/b.mp3".into(),
+            path: PathBuf::from("x"),
+            rel: "a/b.mp3".into(),
+            title: "T".into(),
+            artist: "A".into(),
+            album: "B".into(),
+            duration: 12.0,
+            suffix: "mp3".into(),
+            size: 1,
         };
         let song = track.to_song();
         assert_eq!(song.id, track.id);

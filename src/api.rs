@@ -41,6 +41,13 @@ impl Server {
     pub fn ready(&self) -> bool {
         !self.base.is_empty() && !self.user.is_empty() && !self.password.is_empty()
     }
+
+    /// Stable account identity, even when a saved password is unavailable.
+    pub fn catalog_key(&self) -> Option<String> {
+        let base = checked_base_url(&self.base).ok()?;
+        let user = self.user.trim();
+        (!user.is_empty()).then(|| md5_hex(&format!("{base}\0{user}")))
+    }
 }
 
 #[derive(Clone)]
@@ -81,7 +88,7 @@ impl Client {
             http,
             stream_http,
             base,
-            user: server.user.clone(),
+            user: server.user.trim().to_owned(),
             password: server.password.clone(),
             token,
             salt,
@@ -116,6 +123,9 @@ impl Client {
         if !self.token.is_empty() {
             out = out.replace(&self.token, "[токен скрыт]");
         }
+        if !self.salt.is_empty() {
+            out = out.replace(&self.salt, "[salt скрыт]");
+        }
         out
     }
 
@@ -126,9 +136,9 @@ impl Client {
         let body = read_capped(&mut resp, MAX_JSON_BYTES).map_err(|e| self.redact(e))?;
         let text = String::from_utf8(body).map_err(|_| "сервер прислал некорректный UTF-8".to_string())?;
         if !status.is_success() {
-            return Err(self.redact(format!("HTTP {} — {}", status.as_u16(), snippet(&text))));
+            return Err(format!("HTTP {} — {}", status.as_u16(), snippet(&self.redact(text))));
         }
-        parse_response(&text).map_err(|e| self.redact(e))
+        parse_response(&text).map_err(|e| snippet(&self.redact(e)))
     }
 
     pub fn ping(&self) -> Result<(), String> {
@@ -152,6 +162,14 @@ impl Client {
     }
 
     pub fn album_list(&self, kind: &str, size: u32, offset: u32) -> Result<Vec<Album>, String> {
+        self.album_page(kind, size, offset, false)
+    }
+
+    pub fn catalog_albums(&self, size: u32, offset: u32) -> Result<Vec<Album>, String> {
+        self.album_page("alphabeticalByName", size, offset, true)
+    }
+
+    fn album_page(&self, kind: &str, size: u32, offset: u32, strict: bool) -> Result<Vec<Album>, String> {
         let v = self.get_json(
             "getAlbumList2.view",
             &[("type", kind), ("size", &size.to_string()), ("offset", &offset.to_string())],
@@ -166,7 +184,13 @@ impl Client {
         // only fills the album grid, where one broken row from a non-Navidrome
         // server must not hide every other album. The full-library walk uses
         // `catalog_album`, which stays strict on purpose (see its doc comment).
-        Ok(parse_album_list(&v))
+        let albums = parse_album_list(&v);
+        if strict
+            && list.get("album").and_then(|items| items.as_array()).is_some_and(|items| items.len() != albums.len())
+        {
+            return Err("сервер прислал неполную страницу альбомов; полный обход прерван".into());
+        }
+        Ok(albums)
     }
 
     /// Strict variant for a full-library scan. The regular album view can
@@ -216,7 +240,7 @@ impl Client {
         if !status.is_success() {
             let body = read_capped(&mut resp, MAX_COVER_BYTES).unwrap_or_default();
             let text = String::from_utf8_lossy(&body).into_owned();
-            return Err(self.redact(format!("обложка: HTTP {} — {}", status.as_u16(), snippet(&text))));
+            return Err(format!("обложка: HTTP {} — {}", status.as_u16(), snippet(&self.redact(text))));
         }
         read_capped(&mut resp, MAX_COVER_BYTES).map_err(|e| self.redact(e))
     }
@@ -238,7 +262,7 @@ impl Client {
         if !status.is_success() {
             let body = read_capped(&mut resp, 256 * 1024).unwrap_or_default();
             let text = String::from_utf8_lossy(&body).into_owned();
-            return Err(self.redact(format!("поток: HTTP {} — {}", status.as_u16(), snippet(&text))));
+            return Err(format!("поток: HTTP {} — {}", status.as_u16(), snippet(&self.redact(text))));
         }
         let total = content_length(&resp);
         // The server's content type is more reliable than the song suffix
@@ -262,7 +286,9 @@ fn suffix_from_content_type(value: &str) -> Option<String> {
     let suffix = match codec.as_str() {
         "audio/mpeg" | "audio/mp3" => "mp3",
         "audio/flac" | "audio/x-flac" => "flac",
-        "audio/ogg" | "application/ogg" | "audio/opus" => "ogg",
+        "audio/ogg" | "application/ogg" => "ogg",
+        "audio/opus" => "opus",
+        "audio/webm" | "video/webm" => "webm",
         "audio/mp4" | "audio/m4a" | "audio/x-m4a" => "m4a",
         "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
         _ => return None,
@@ -352,7 +378,7 @@ fn safe_suffix(suffix: &str) -> String {
     let cleaned: String =
         suffix.chars().filter(|c| c.is_ascii_alphanumeric()).take(5).collect::<String>().to_ascii_lowercase();
     match cleaned.as_str() {
-        "mp3" | "flac" | "ogg" | "oga" | "opus" | "wav" | "m4a" | "aac" | "mp4" | "wv" => cleaned,
+        "mp3" | "flac" | "ogg" | "oga" | "opus" | "webm" | "mka" | "wav" | "m4a" | "aac" | "mp4" | "wv" => cleaned,
         _ => "mp3".to_owned(),
     }
 }
@@ -398,6 +424,43 @@ fn snippet(body: &str) -> String {
 // Response parsing. Every field is optional: Navidrome omits what it does not
 // know, and some servers send numbers as strings.
 // ---------------------------------------------------------------------------
+
+pub const MAX_TEXT_CHARS: usize = 1024;
+
+pub fn bounded_text(text: &str) -> String {
+    text.chars().take(MAX_TEXT_CHARS).collect()
+}
+
+pub(crate) fn de_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    String::deserialize(d).map(|text| bounded_text(&text))
+}
+
+fn de_suffix<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    String::deserialize(d).map(|suffix| safe_suffix(&suffix))
+}
+
+/// Local rows and cover files use reserved namespaces. A server cannot name
+/// a track in those namespaces and make its row refer to a local file.
+pub fn remote_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 1024
+        && !id.contains('\0')
+        && !["local:", "local-album:", "local-artist:", "file:"].iter().any(|prefix| id.starts_with(prefix))
+}
+
+fn remote_album(mut album: Album) -> Album {
+    if !remote_id(&album.cover_id) {
+        album.cover_id.clear();
+    }
+    album
+}
+
+fn remote_song(mut song: Song) -> Song {
+    if !remote_id(&song.cover_id) {
+        song.cover_id.clear();
+    }
+    song
+}
 
 fn de_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
     d.deserialize_any(U64Visitor)
@@ -481,6 +544,7 @@ pub struct Artist {
     #[serde(default)]
     pub id: String,
     #[serde(default)]
+    #[serde(deserialize_with = "de_text")]
     pub name: String,
     #[serde(default, rename = "albumCount", deserialize_with = "de_u32")]
     pub album_count: u32,
@@ -491,8 +555,10 @@ pub struct Album {
     #[serde(default)]
     pub id: String,
     #[serde(default)]
+    #[serde(deserialize_with = "de_text")]
     pub name: String,
     #[serde(default)]
+    #[serde(deserialize_with = "de_text")]
     pub artist: String,
     #[serde(default, rename = "coverArt")]
     pub cover_id: String,
@@ -507,10 +573,13 @@ pub struct Song {
     #[serde(default)]
     pub id: String,
     #[serde(default)]
+    #[serde(deserialize_with = "de_text")]
     pub title: String,
     #[serde(default)]
+    #[serde(deserialize_with = "de_text")]
     pub artist: String,
     #[serde(default)]
+    #[serde(deserialize_with = "de_text")]
     pub album: String,
     /// Cover id of the song, for the unified library list. `rename` on both
     /// ser and de keeps the on-disk cache in the Subsonic spelling.
@@ -521,6 +590,7 @@ pub struct Song {
     #[serde(default, deserialize_with = "de_f64")]
     pub duration: f64,
     #[serde(default)]
+    #[serde(deserialize_with = "de_suffix")]
     pub suffix: String,
 }
 
@@ -549,7 +619,6 @@ fn parse_response(body: &str) -> Result<serde_json::Value, String> {
             .and_then(|e| e.get("message"))
             .and_then(|m| m.as_str())
             .unwrap_or("сервер отклонил запрос");
-        let message = snippet(message);
         let code = response.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_u64());
         return Err(match code {
             Some(code) => format!("сервер: {message} (код {code})"),
@@ -566,7 +635,7 @@ fn parse_artists(response: &serde_json::Value) -> Vec<Artist> {
             if let Some(list) = index.get("artist").and_then(|a| a.as_array()) {
                 for artist in list {
                     match serde_json::from_value::<Artist>(artist.clone()) {
-                        Ok(artist) if !artist.id.is_empty() => artists.push(artist),
+                        Ok(artist) if remote_id(&artist.id) => artists.push(artist),
                         _ => {}
                     }
                 }
@@ -588,7 +657,8 @@ fn parse_artist(response: &serde_json::Value) -> (Artist, Vec<Album>) {
         .map(|list| {
             list.iter()
                 .filter_map(|a| serde_json::from_value::<Album>(a.clone()).ok())
-                .filter(|a| !a.id.is_empty())
+                .filter(|a| remote_id(&a.id))
+                .map(remote_album)
                 .collect()
         })
         .unwrap_or_default();
@@ -598,14 +668,15 @@ fn parse_artist(response: &serde_json::Value) -> (Artist, Vec<Album>) {
 
 fn parse_album(response: &serde_json::Value) -> (Album, Vec<Song>) {
     let Some(node) = response.get("album") else { return (Album::default(), Vec::new()) };
-    let album = serde_json::from_value::<Album>(node.clone()).unwrap_or_default();
+    let album = remote_album(serde_json::from_value::<Album>(node.clone()).unwrap_or_default());
     let mut songs: Vec<Song> = node
         .get("song")
         .and_then(|s| s.as_array())
         .map(|list| {
             list.iter()
                 .filter_map(|s| serde_json::from_value::<Song>(s.clone()).ok())
-                .filter(|s| !s.id.is_empty())
+                .filter(|s| remote_id(&s.id))
+                .map(remote_song)
                 .collect()
         })
         .unwrap_or_default();
@@ -620,7 +691,8 @@ fn parse_album_list(response: &serde_json::Value) -> Vec<Album> {
         .map(|list| {
             list.iter()
                 .filter_map(|a| serde_json::from_value::<Album>(a.clone()).ok())
-                .filter(|a| !a.id.is_empty())
+                .filter(|a| remote_id(&a.id))
+                .map(remote_album)
                 .collect()
         })
         .unwrap_or_default()
@@ -633,20 +705,25 @@ fn parse_search(response: &serde_json::Value) -> SearchResult {
         artists: list("artist")
             .into_iter()
             .flatten()
+            .take(8)
             .filter_map(|a| serde_json::from_value::<Artist>(a.clone()).ok())
-            .filter(|a| !a.id.is_empty())
+            .filter(|a| remote_id(&a.id))
             .collect(),
         albums: list("album")
             .into_iter()
             .flatten()
+            .take(8)
             .filter_map(|a| serde_json::from_value::<Album>(a.clone()).ok())
-            .filter(|a| !a.id.is_empty())
+            .filter(|a| remote_id(&a.id))
+            .map(remote_album)
             .collect(),
         songs: list("song")
             .into_iter()
             .flatten()
+            .take(30)
             .filter_map(|s| serde_json::from_value::<Song>(s.clone()).ok())
-            .filter(|s| !s.id.is_empty())
+            .filter(|s| remote_id(&s.id))
+            .map(remote_song)
             .collect(),
     }
 }
@@ -654,6 +731,71 @@ fn parse_search(response: &serde_json::Value) -> SearchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secrets_are_redacted_before_a_server_error_is_shortened() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = Server {
+            base: format!("http://{}", listener.local_addr().unwrap()),
+            user: "test".into(),
+            password: "very-long-private-password".into(),
+        };
+        let client = Client::new(&server, StreamFormat::Raw, 320).unwrap();
+        let responses = std::sync::Mutex::new(std::collections::VecDeque::from([
+            (500, format!("{}{}", "x".repeat(290), server.password)),
+            (500, format!("{}{}", "x".repeat(290), client.token)),
+            (200, serde_json::json!({"subsonic-response":{"status":"failed","error":{"message":format!("{}{}", "x".repeat(290), client.salt)}}}).to_string()),
+            (500, format!("{}{}", "x".repeat(290), server.password)),
+            (500, format!("{}{}", "x".repeat(290), client.token)),
+        ]));
+        let worker = serve(listener, 5, move |_| {
+            let (status, body) = responses.lock().unwrap().pop_front().unwrap();
+            format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+        });
+        let mut errors = (0..3).map(|_| client.ping().unwrap_err()).collect::<Vec<_>>();
+        errors.push(client.cover_bytes("1", 96).unwrap_err());
+        errors.push(client.open_stream(&Song::default()).err().unwrap());
+        worker.join().unwrap();
+        for error in errors {
+            assert!(error.chars().count() < 400);
+            for secret in [&server.password, &client.token, &client.salt] {
+                assert!(!error.contains(&secret[..10]), "a partial credential reached the UI");
+            }
+        }
+        assert_eq!(server.catalog_key().unwrap(), client.catalog_key());
+    }
+
+    #[test]
+    fn a_full_catalog_rejects_a_page_that_the_album_view_can_partially_display() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = Client::new(
+            &Server {
+                base: format!("http://{}", listener.local_addr().unwrap()),
+                user: "u".into(),
+                password: "p".into(),
+            },
+            StreamFormat::Raw,
+            320,
+        )
+        .unwrap();
+        let worker = serve(listener, 2, |_| {
+            let body = r#"{"subsonic-response":{"status":"ok","albumList2":{"album":[{"id":"1"},{"id":"local-album:spoof"}]}}}"#;
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+        });
+        assert_eq!(client.album_list("newest", 100, 0).unwrap().len(), 1);
+        assert!(client.catalog_albums(100, 0).is_err());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn remote_metadata_cannot_impersonate_local_files_or_grow_unbounded_labels() {
+        let value = serde_json::json!({"album":{"id":"1","song":[{"id":"local:victim.mp3"},{"id":"2","title":"я".repeat(100_000),"coverArt":"file:private.mp3"}]}});
+        let (_, songs) = parse_album(&value);
+        assert_eq!(songs.len(), 1);
+        assert_eq!(songs[0].title.chars().count(), MAX_TEXT_CHARS);
+        assert!(songs[0].cover_id.is_empty());
+        assert!(!remote_id(&"a".repeat(1025)));
+    }
 
     #[test]
     fn base_url_must_be_secure_and_clean() {
@@ -785,9 +927,6 @@ mod tests {
         assert!(err.contains("40"));
         assert!(parse_response("<html>bad gateway</html>").is_err());
         assert!(parse_response(r#"{"other":1}"#).is_err());
-        let oversized =
-            serde_json::json!({"subsonic-response": {"status": "failed", "error": {"message": "x".repeat(1000)}}});
-        assert!(parse_response(&oversized.to_string()).unwrap_err().chars().count() < 400);
     }
 
     #[test]

@@ -86,6 +86,13 @@ def check(path):
     }
     (path.parent / "BUILD.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     (path.parent / "SHA256SUMS.txt").write_text(f"{digest}  {path.name}\n", encoding="ascii")
+    notices = [ROOT / "fonts/OFL-notice.txt", ROOT / "fonts/OFL.txt",
+               *sorted((ROOT / "third_party").glob("*-LICENSE.txt")),
+               ROOT / "vendor/symphonia-core/LICENSE"]
+    (path.parent / "COMPONENT-NOTICES.txt").write_text(
+        "\n\n".join(f"{file.relative_to(ROOT)}\n\n{file.read_text(encoding='utf-8')}" for file in notices),
+        encoding="utf-8",
+    )
     print(f"Verified unsigned {package['name']} Windows x64 GUI / {commit}")
 
 

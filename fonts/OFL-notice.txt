@@ -1,7 +1,8 @@
 Cascadia Mono
 Copyright (c) Microsoft Corporation, https://github.com/microsoft/cascadia-code
 Licensed under the SIL Open Font License, Version 1.1
-License text: https://scripts.sil.org/OFL
+Full license text: OFL.txt in this directory
+Upstream: https://github.com/microsoft/cascadia-code/blob/main/LICENSE
 
 CascadiaMono-Light.ttf in this directory is a Modified Version: the variable
 font (wght 200-700) instantiated at wght=300 and flattened to a static ttf

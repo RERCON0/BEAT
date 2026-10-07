@@ -40,8 +40,11 @@ pub struct CachedTrack {
     pub id: String,
     /// Relative path inside the cache root, `/`-separated.
     pub path: String,
+    #[serde(deserialize_with = "crate::api::de_text")]
     pub title: String,
+    #[serde(deserialize_with = "crate::api::de_text")]
     pub artist: String,
+    #[serde(deserialize_with = "crate::api::de_text")]
     pub album: String,
     #[serde(default)]
     pub duration: f64,
@@ -84,6 +87,7 @@ pub struct Cache {
 
 struct Inner {
     root: PathBuf,
+    index_name: String,
     index: Mutex<HashMap<String, CachedTrack>>,
     /// Final paths (lowercase, `/`-separated, relative) claimed by running
     /// downloads: nothing on disk marks them as taken until the download ends.
@@ -95,7 +99,7 @@ struct Inner {
     /// Cached `stats()`. Recomputed from the index after every change to it.
     stats: Mutex<CacheStats>,
     /// Why the index started empty (unreadable/oversized file), for the UI.
-    warning: Option<String>,
+    warning: Mutex<Option<String>>,
     /// The unreadable index could not be set aside: never overwrite it.
     save_blocked: bool,
 }
@@ -112,19 +116,42 @@ impl Cache {
         let stamp =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
         let loaded = load_index(&root, stamp);
-        Self::from_loaded(root, loaded)
+        Self::from_loaded(root, INDEX_FILE.into(), loaded)
     }
 
-    fn from_loaded(root: PathBuf, loaded: LoadedIndex) -> Cache {
+    /// A track id belongs to one server/account, not to every server the user
+    /// may configure. Existing unscoped data is adopted only at startup, while
+    /// the saved configuration still identifies its original account.
+    pub fn load_profile(root: PathBuf, profile: Option<&str>, adopt_legacy: bool) -> Cache {
+        let Some(profile) = profile else { return Self::load(root) };
+        let name = profile_index_name(profile);
+        let target = root.join(&name);
+        let legacy = root.join(INDEX_FILE);
+        let migration_error = if adopt_legacy && !target.exists() && legacy.is_file() {
+            std::fs::rename(&legacy, &target).err()
+        } else {
+            None
+        };
+        let stamp =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let mut loaded = load_index_file(&root, stamp, &name);
+        if let Some(error) = migration_error {
+            loaded.warning = Some(format!("не удалось перенести прежний индекс кеша: {error}; аудиофайлы сохранены"));
+        }
+        Self::from_loaded(root, name, loaded)
+    }
+
+    fn from_loaded(root: PathBuf, index_name: String, loaded: LoadedIndex) -> Cache {
         let cache = Cache {
             inner: Arc::new(Inner {
                 root,
+                index_name,
                 index: Mutex::new(loaded.tracks),
                 reserved: Mutex::new(HashSet::new()),
                 save_lock: Mutex::new(()),
                 max_track_bytes: AtomicU64::new(MAX_TRACK_BYTES),
                 stats: Mutex::new(CacheStats::default()),
-                warning: loaded.warning,
+                warning: Mutex::new(loaded.warning),
                 save_blocked: loaded.save_blocked,
             }),
         };
@@ -132,14 +159,13 @@ impl Cache {
         cache
     }
 
-    /// The cache to use for `root` after a settings change: this very instance
-    /// when the folder did not change (downloads still running write through
-    /// it, and two instances over one folder overwrite each other's index).
-    pub fn for_root(&self, root: PathBuf) -> Cache {
-        if root == self.inner.root {
+    /// Keep one shared index while downloads are running for the same account.
+    pub fn for_profile(&self, root: PathBuf, profile: Option<&str>) -> Cache {
+        let name = profile.map(profile_index_name).unwrap_or_else(|| INDEX_FILE.into());
+        if root == self.inner.root && name == self.inner.index_name {
             self.clone()
         } else {
-            Cache::load(root)
+            Self::load_profile(root, profile, false)
         }
     }
 
@@ -149,8 +175,8 @@ impl Cache {
     }
 
     /// A problem found while loading the index, worth showing once.
-    pub fn warning(&self) -> Option<String> {
-        self.inner.warning.clone()
+    pub fn take_warning(&self) -> Option<String> {
+        crate::lock(&self.inner.warning).take()
     }
 
     pub fn root(&self) -> &Path {
@@ -320,7 +346,19 @@ impl Cache {
             crate::lock(&self.inner.index).values().map(|entry| (entry.id.clone(), entry.path.clone())).collect();
         let gone: Vec<(String, String)> = snapshot
             .into_iter()
-            .filter(|(_, path)| self.resolve_rel(path).is_none_or(|path| !path.is_file()))
+            .filter(|(_, relative)| {
+                // Access denied or a transient network failure does not prove
+                // deletion. Known unsafe paths must still leave the index.
+                let path = match checked_path(self.root(), relative) {
+                    Ok(path) => path,
+                    Err(PathError::Unsafe) => return true,
+                    Err(PathError::Unavailable) => return false,
+                };
+                match std::fs::metadata(path) {
+                    Ok(metadata) => !metadata.is_file(),
+                    Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                }
+            })
             .collect();
         let removed = {
             let mut index = crate::lock(&self.inner.index);
@@ -334,7 +372,9 @@ impl Cache {
         };
         if removed > 0 {
             self.refresh_stats();
-            let _ = self.save_index();
+            if let Err(error) = self.save_index() {
+                *crate::lock(&self.inner.warning) = Some(error);
+            }
         }
         removed
     }
@@ -349,7 +389,10 @@ impl Cache {
     /// threads that write to it.
     fn refresh_stats(&self) {
         let index = crate::lock(&self.inner.index);
-        let stats = CacheStats { count: index.len(), bytes: index.values().map(|entry| entry.size).sum() };
+        let stats = CacheStats {
+            count: index.len(),
+            bytes: index.values().fold(0u64, |total, entry| total.saturating_add(entry.size)),
+        };
         *crate::lock(&self.inner.stats) = stats;
     }
 
@@ -393,7 +436,7 @@ impl Cache {
             return Err("индекс кеша слишком большой".into());
         }
         std::fs::create_dir_all(&self.inner.root).map_err(|e| format!("не удалось создать кеш: {e}"))?;
-        atomic_write(&self.inner.root.join(INDEX_FILE), &raw)
+        atomic_write(&self.inner.root.join(&self.inner.index_name), &raw)
     }
 }
 
@@ -402,26 +445,39 @@ impl Cache {
 /// entries whose path leaves the cache folder are dropped: the index sits in a
 /// folder that may be synced or shared, and its paths are used for deletion.
 fn load_index(root: &Path, stamp: u128) -> LoadedIndex {
-    let path = root.join(INDEX_FILE);
+    load_index_file(root, stamp, INDEX_FILE)
+}
+
+fn profile_index_name(profile: &str) -> String {
+    use md5::{Digest, Md5};
+    format!(".beat-index-{:x}.json", Md5::digest(profile.as_bytes()))
+}
+
+fn load_index_file(root: &Path, stamp: u128, name: &str) -> LoadedIndex {
+    let path = root.join(name);
     let parsed = match read_capped(&path, MAX_INDEX_BYTES) {
         Ok(None) => return LoadedIndex { tracks: HashMap::new(), warning: None, save_blocked: false },
         Ok(Some(raw)) => serde_json::from_slice::<IndexFile>(&raw).map_err(|e| e.to_string()),
         Err(err) => Err(err.to_string()),
     };
     match parsed {
-        Ok(file) => {
+        Ok(file) if file.version == 1 => {
             let total = file.tracks.len();
             let tracks: HashMap<String, CachedTrack> = file
                 .tracks
                 .into_iter()
-                .filter(|(id, entry)| id == &entry.id && safe_path(root, &entry.path).is_some())
+                .filter(|(id, entry)| {
+                    id == &entry.id
+                        && crate::api::remote_id(id)
+                        && !matches!(checked_path(root, &entry.path), Err(PathError::Unsafe))
+                })
                 .collect();
             let dropped = total - tracks.len();
             let warning =
                 (dropped > 0).then(|| format!("в индексе кеша пропущено записей с небезопасным путём: {dropped}"));
             LoadedIndex { tracks, warning, save_blocked: false }
         }
-        Err(_) => match set_aside(&path, stamp) {
+        _ => match set_aside(&path, stamp) {
             Some(name) => LoadedIndex {
                 tracks: HashMap::new(),
                 warning: Some(format!("индекс кеша повреждён и начат заново; старый файл сохранён как {name}")),
@@ -479,7 +535,7 @@ pub fn is_safe_rel(rel: &str) -> bool {
                 && part != "."
                 && part != ".."
                 && !is_device_name(part)
-                && !part.to_ascii_lowercase().starts_with(".beat-index.")
+                && !part.to_ascii_lowercase().starts_with(".beat-index")
                 && !part.to_ascii_lowercase().ends_with(".part")
                 && !part.ends_with(['.', ' '])
                 && !part.chars().any(|c| c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*'))
@@ -489,8 +545,17 @@ pub fn is_safe_rel(rel: &str) -> bool {
 /// Refuse existing symlinks and Windows junctions at every level: a lexical
 /// path inside the cache can otherwise resolve outside it when read or deleted.
 fn safe_path(root: &Path, rel: &str) -> Option<PathBuf> {
+    checked_path(root, rel).ok()
+}
+
+enum PathError {
+    Unsafe,
+    Unavailable,
+}
+
+fn checked_path(root: &Path, rel: &str) -> Result<PathBuf, PathError> {
     if !is_safe_rel(rel) {
-        return None;
+        return Err(PathError::Unsafe);
     }
     let mut path = root.to_path_buf();
     for part in rel.split('/') {
@@ -498,21 +563,21 @@ fn safe_path(root: &Path, rel: &str) -> Option<PathBuf> {
         match std::fs::symlink_metadata(&path) {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
-                    return None;
+                    return Err(PathError::Unsafe);
                 }
                 #[cfg(windows)]
                 {
                     use std::os::windows::fs::MetadataExt;
                     if meta.file_attributes() & 0x400 != 0 {
-                        return None;
+                        return Err(PathError::Unsafe);
                     } // FILE_ATTRIBUTE_REPARSE_POINT
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return None,
+            Err(_) => return Err(PathError::Unavailable),
         }
     }
-    Some(path)
+    Ok(path)
 }
 
 pub fn part_path(path: &Path) -> PathBuf {
@@ -522,15 +587,16 @@ pub fn part_path(path: &Path) -> PathBuf {
 }
 
 /// Cheap "is this audio at all" probe on the first bytes of a finished
-/// download. Only container magic is looked for, so a format the decoder stack
-/// cannot play (opus inside an ogg container) is still cached as before, while
-/// an error page or a `200 OK` carrying "Bad Gateway" is refused. The window is
+/// download. Only container magic is looked for, so an unsupported codec may
+/// still be cached, while an error page or a `200 OK` carrying "Bad Gateway"
+/// is refused. The window is
 /// a few kilobytes because an ID3v2 tag or a small amount of leading junk can
 /// sit before the first real frame.
 fn looks_like_audio(path: &Path) -> Result<(), String> {
     use std::io::Read;
     const WINDOW: usize = 4096;
     let mut file = std::fs::File::open(path).map_err(|e| format!("не удалось открыть {}: {e}", path.display()))?;
+    crate::media::validate_metadata(&mut file).map_err(|e| format!("метаданные: {e}"))?;
     let mut head = vec![0u8; WINDOW];
     let read = file.read(&mut head).map_err(|e| format!("не удалось прочитать кеш: {e}"))?;
     let head = &head[..read];
@@ -658,9 +724,9 @@ pub fn sanitize_component(raw: &str, fallback: &str, max: usize) -> String {
 fn is_device_name(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or_default().trim_end().to_ascii_uppercase();
     matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (stem.len() == 4
-            && (stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.ends_with(|c: char| ('1'..='9').contains(&c)))
+        || stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT")).is_some_and(|number| {
+            matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -704,7 +770,13 @@ impl Progress {
     /// Blocks until at least `needed` bytes are downloaded, the download is
     /// finished, or it failed. `Ok(())` also means "finished with less". A
     /// waiter that must be interruptible passes a `cancel` flag.
-    pub fn wait_for(&self, needed: u64, timeout: Duration, cancel: Option<&AtomicBool>) -> Result<(), String> {
+    pub fn wait_for(
+        &self,
+        needed: u64,
+        timeout: Duration,
+        cancel: Option<&AtomicBool>,
+        nonblocking: Option<&AtomicBool>,
+    ) -> Result<(), String> {
         let deadline = std::time::Instant::now() + timeout;
         let mut state = crate::lock(&self.state);
         loop {
@@ -717,13 +789,16 @@ impl Progress {
             if state.downloaded >= needed || state.finished {
                 return Ok(());
             }
+            if nonblocking.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+                return Err("декодеру нужно дождаться дополнительных данных".into());
+            }
             let now = std::time::Instant::now();
             if now >= deadline {
                 return Err("сервер слишком медленно отдаёт трек".into());
             }
             // The flag is not tied to the condvar: look at it regularly.
             let mut wait = deadline - now;
-            if cancel.is_some() {
+            if cancel.is_some() || nonblocking.is_some() {
                 wait = wait.min(Duration::from_millis(100));
             }
             let (next, _) = self.cond.wait_timeout(state, wait).unwrap();
@@ -831,9 +906,14 @@ impl GrowingReader {
                 ));
             }
         }
-        self.progress
-            .wait_for(needed, Duration::from_secs(60), Some(&self.cancel))
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{}: {e}", self.path.display())))
+        self.progress.wait_for(needed, Duration::from_secs(60), Some(&self.cancel), Some(&self.startup)).map_err(|e| {
+            let kind = if self.startup.load(Ordering::SeqCst) {
+                std::io::ErrorKind::WouldBlock
+            } else {
+                std::io::ErrorKind::TimedOut
+            };
+            std::io::Error::new(kind, format!("{}: {e}", self.path.display()))
+        })
     }
 }
 
@@ -1082,6 +1162,188 @@ fn run_download(
 mod tests {
     use super::*;
 
+    #[test]
+    fn starting_a_seek_interrupts_an_existing_network_wait() {
+        use std::io::Read;
+        let root = temp_root("seek-interrupt");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("waiting.part");
+        std::fs::write(&path, []).unwrap();
+        let mut reader = GrowingReader::open(Progress::new(Some(100)), &path).unwrap();
+        let flag = reader.startup_handle();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(()).unwrap();
+            reader.read(&mut [0]).unwrap_err().kind()
+        });
+        rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let started = std::time::Instant::now();
+        flag.store(true, Ordering::SeqCst);
+        assert_eq!(worker.join().unwrap(), std::io::ErrorKind::WouldBlock);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn webm_opus_starts_from_a_partial_download() {
+        let bytes = include_bytes!("../tests/fixtures/tone.webm");
+        let root = temp_root("stream-webm-opus");
+        std::fs::create_dir_all(&root).unwrap();
+        let part = root.join("audio.webm.part");
+        let prefix = bytes.len() / 2;
+        std::fs::write(&part, &bytes[..prefix]).unwrap();
+        let progress = Progress::new(Some(bytes.len() as u64));
+        progress.opened(part.clone(), Some(bytes.len() as u64));
+        progress.add(prefix as u64);
+        let reader = GrowingReader::open(progress, &part).unwrap();
+        reader.startup_handle().store(true, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let mut decoder = crate::player::open_stream_decoder(reader, Some(bytes.len() as u64)).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(decoder.by_ref().take(9600).any(|sample| sample.abs() > 0.01));
+        decoder.try_seek(Duration::from_millis(250)).unwrap();
+        assert!(decoder.by_ref().take(9600).any(|sample| sample.abs() > 0.01));
+        drop(decoder);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_is_unsafe_even_when_unavailable_paths_are_kept() {
+        let base = temp_root("junction-index");
+        let root = base.join("cache");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("victim.mp3"), b"keep").unwrap();
+        let junction = root.join("Band");
+        let result = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        write_index(&root, &[("bad", "Band/victim.mp3")]);
+        let cache = Cache::load(root.clone());
+        assert_eq!(cache.stats().0, 0);
+        assert!(cache.resolve_rel("Band/victim.mp3").is_none());
+        cache.clear().unwrap();
+        assert_eq!(std::fs::read(outside.join("victim.mp3")).unwrap(), b"keep");
+        std::fs::remove_dir(junction).unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn opus_starts_from_a_growing_file_without_waiting_for_the_final_page() {
+        let bytes = include_bytes!("../tests/fixtures/tone.opus");
+        let mut prefix = 0;
+        // OpusHead, OpusTags, then the first page of audio; leave later pages
+        // unavailable, as if the network had stalled during the download.
+        for _ in 0..3 {
+            assert_eq!(&bytes[prefix..prefix + 4], b"OggS");
+            let segments = usize::from(bytes[prefix + 26]);
+            let payload: usize = bytes[prefix + 27..prefix + 27 + segments].iter().map(|byte| usize::from(*byte)).sum();
+            prefix += 27 + segments + payload;
+        }
+        assert!(prefix < bytes.len());
+        let root = temp_root("stream-opus");
+        std::fs::create_dir_all(&root).unwrap();
+        let part = root.join("audio.opus.part");
+        std::fs::write(&part, &bytes[..prefix]).unwrap();
+        let progress = Progress::new(Some(bytes.len() as u64));
+        progress.opened(part.clone(), Some(bytes.len() as u64));
+        progress.add(prefix as u64);
+        let reader = GrowingReader::open(progress, &part).unwrap();
+        reader.startup_handle().store(true, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let mut decoder = crate::player::open_stream_decoder(reader, Some(bytes.len() as u64)).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(decoder.by_ref().take(9600).any(|sample| sample.abs() > 0.01));
+        decoder.try_seek(Duration::from_millis(250)).unwrap();
+        assert!(decoder.by_ref().take(9600).any(|sample| sample.abs() > 0.01));
+        drop(decoder);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pruning_reports_write_failures_instead_of_silently_claiming_persistence() {
+        let root = temp_root("prune-save-error");
+        let cache = Cache::load(root.clone());
+        cache.insert(CachedTrack { id: "1".into(), path: "gone.mp3".into(), ..Default::default() }).unwrap();
+        std::fs::remove_file(root.join(INDEX_FILE)).unwrap();
+        std::fs::create_dir(root.join(INDEX_FILE)).unwrap();
+        assert_eq!(cache.prune_missing(), 1);
+        assert!(cache.take_warning().is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_oversized_audio_tag_never_becomes_a_finished_cached_track() {
+        let root = temp_root("huge-id3");
+        let cache = Cache::load(root.clone());
+        let stream = api::AudioStream {
+            reader: Box::new(std::io::Cursor::new(b"ID3\x04\0\0\x7f\x7f\x7f\x7f")),
+            total: None,
+            suffix: "mp3".into(),
+        };
+        assert!(download_stream(&cache, &song("1", "B", "A", "S", 1), stream, &Progress::new(None), "raw").is_err());
+        assert_eq!(cache.stats().0, 0);
+        assert!(!root.join("B/A/01 - S.mp3").exists());
+        assert!(!root.join("B/A/01 - S.mp3.part").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn identical_track_ids_on_different_accounts_never_share_audio_or_deletion() {
+        let root = temp_root("accounts");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("first.mp3"), b"first").unwrap();
+        std::fs::write(root.join("second.mp3"), b"second").unwrap();
+        let first = Cache::load_profile(root.clone(), Some("first"), false);
+        first.insert(CachedTrack { id: "1".into(), path: "first.mp3".into(), ..Default::default() }).unwrap();
+        let second = first.for_profile(root.clone(), Some("second"));
+        assert!(!second.contains("1"), "another account reused the cached track");
+        second.insert(CachedTrack { id: "1".into(), path: "second.mp3".into(), ..Default::default() }).unwrap();
+        let first = Cache::load_profile(root.clone(), Some("first"), true);
+        assert_eq!(first.entry("1").unwrap().path, "first.mp3");
+        first.clear().unwrap();
+        assert!(root.join("second.mp3").exists());
+        assert_eq!(Cache::load_profile(root.clone(), Some("second"), true).entry("1").unwrap().path, "second.mp3");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_audio_index_is_adopted_once_only_by_the_saved_account() {
+        let root = temp_root("adoption");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("song.mp3"), b"audio").unwrap();
+        Cache::load(root.clone())
+            .insert(CachedTrack { id: "1".into(), path: "song.mp3".into(), ..Default::default() })
+            .unwrap();
+        assert!(!Cache::load_profile(root.clone(), Some("new-account"), false).contains("1"));
+        assert!(root.join(INDEX_FILE).is_file());
+        assert!(Cache::load_profile(root.clone(), Some("saved-account"), true).contains("1"));
+        assert!(!root.join(INDEX_FILE).exists());
+        assert!(!Cache::load_profile(root.clone(), Some("new-account"), true).contains("1"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tampered_sizes_do_not_overflow_cache_statistics() {
+        let root = temp_root("size-overflow");
+        let cache = Cache::load(root.clone());
+        for id in ["a", "b"] {
+            cache
+                .insert(CachedTrack { id: id.into(), path: format!("{id}.mp3"), size: u64::MAX, ..Default::default() })
+                .unwrap();
+        }
+        assert_eq!(Cache::load(root.clone()).stats(), (2, u64::MAX));
+        assert!(cache.resolve_rel(".beat-index-abc.json").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn song(id: &str, artist: &str, album: &str, title: &str, track: u32) -> Song {
         Song {
             id: id.into(),
@@ -1206,7 +1468,7 @@ mod tests {
     fn failed_download_reports_the_error_to_waiters() {
         let progress = Progress::new(None);
         progress.fail("обрыв".into());
-        assert!(progress.wait_for(1, Duration::from_millis(100), None).is_err());
+        assert!(progress.wait_for(1, Duration::from_millis(100), None, None).is_err());
     }
 
     /// `n` bytes of synthetic audio, then end of stream: a real container
@@ -1307,9 +1569,11 @@ mod tests {
 
     #[test]
     fn windows_device_names_are_not_used_as_file_names() {
-        for name in ["CON", "con", "Nul", "AUX", "prn", "COM1", "lpt9", "Con.Remix", "NUL "] {
+        for name in ["CON", "con", "Nul", "AUX", "prn", "COM1", "lpt9", "Con.Remix", "NUL ", "COM¹", "com².mp3", "LPT³"]
+        {
             let clean = sanitize_component(name, "x", MAX_COMPONENT);
             assert!(clean.starts_with('_'), "{name:?} became {clean:?}");
+            assert!(!is_safe_rel(&format!("{name}.mp3")), "{name:?} is not a safe path");
         }
         for name in ["Console", "COM10", "Communication", "Aux Cord", "LPT0", "Nulla"] {
             assert_eq!(sanitize_component(name, "x", MAX_COMPONENT), name, "{name:?} is a legal name");
@@ -1533,7 +1797,7 @@ mod tests {
         let entry = |id: &str| CachedTrack { id: id.into(), path: format!("{id}.mp3"), ..CachedTrack::default() };
         let running = Cache::load(root.clone());
         // Settings saved while a download is still running...
-        let after_settings = running.for_root(root.clone());
+        let after_settings = running.for_profile(root.clone(), None);
         // ...which finishes through the old handle, and another one through the new.
         running.insert(entry("first")).unwrap();
         after_settings.insert(entry("second")).unwrap();
@@ -1542,7 +1806,7 @@ mod tests {
         assert!(ids.contains(&"first".to_owned()), "the first download vanished from the index: {ids:?}");
         assert!(ids.contains(&"second".to_owned()), "{ids:?}");
         let other = temp_root("other-root");
-        assert_eq!(running.for_root(other.clone()).root(), other.as_path());
+        assert_eq!(running.for_profile(other.clone(), None).root(), other.as_path());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1636,7 +1900,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join(INDEX_FILE), b"{ not json").unwrap();
         let cache = Cache::load(root.clone());
-        assert!(cache.warning().is_some(), "the user is never told the index was dropped");
+        assert!(cache.take_warning().is_some(), "the user is never told the index was dropped");
         cache.insert(CachedTrack { id: "1".into(), path: "a.mp3".into(), ..CachedTrack::default() }).unwrap();
         let backups: Vec<PathBuf> = std::fs::read_dir(&root)
             .unwrap()
@@ -1647,7 +1911,7 @@ mod tests {
         assert_eq!(backups.len(), 1, "{backups:?}");
         assert_eq!(std::fs::read(&backups[0]).unwrap(), b"{ not json");
         let reloaded = Cache::load(root.clone());
-        assert!(reloaded.warning().is_none());
+        assert!(reloaded.take_warning().is_none());
         assert_eq!(reloaded.stats().0, 1);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1662,7 +1926,7 @@ mod tests {
         let loaded = load_index(&root, 5);
         assert!(loaded.save_blocked);
         assert!(loaded.warning.is_some());
-        let cache = Cache::from_loaded(root.clone(), loaded);
+        let cache = Cache::from_loaded(root.clone(), INDEX_FILE.into(), loaded);
         let result = cache.insert(CachedTrack { id: "1".into(), path: "a.mp3".into(), ..CachedTrack::default() });
         let untouched = std::fs::read(root.join(INDEX_FILE)).unwrap() == b"garbage";
         let _ = std::fs::remove_dir_all(root);
@@ -1767,7 +2031,7 @@ mod tests {
         // Real audio in every supported container still gets through.
         let heads: [(&[u8], &str); 5] = [
             (b"ID3\x04\x00\x00", "id3.mp3"),
-            (b"fLaC\x00\x00\x00\x22", "flac.flac"),
+            (b"fLaC\x80\x00\x00\x22", "flac.flac"),
             (b"OggS\x00\x02", "ogg.ogg"),
             (b"RIFF\x00\x00\x00\x00WAVEfmt ", "wave.wav"),
             (&[0xff, 0xfb, 0x90, 0x00], "sync.mp3"),

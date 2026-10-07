@@ -29,14 +29,16 @@ pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), S
     let nonce =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
     let temp = path.with_extension(format!("{}.{}.tmp", std::process::id(), nonce));
+    let mut created = false;
     let result = (|| -> std::io::Result<()> {
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        created = true;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         std::fs::rename(&temp, path)
     })();
-    if result.is_err() {
+    if created && result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
     result.map_err(|e| format!("не удалось записать {path:?}: {e}"))
@@ -353,6 +355,14 @@ impl Config {
     }
 
     fn save_to(&mut self, path: &std::path::Path) -> Result<(), String> {
+        self.save_to_with(path, protect_secret)
+    }
+
+    fn save_to_with(
+        &mut self,
+        path: &std::path::Path,
+        protect: fn(&str) -> Result<String, String>,
+    ) -> Result<(), String> {
         if self.save_blocked {
             return Err("config.json не был прочитан; сохранение заблокировано во избежание потери данных".into());
         }
@@ -364,13 +374,15 @@ impl Config {
         disk.password = if self.password.is_empty() {
             self.unreadable_password.clone().unwrap_or_default()
         } else {
-            match protect_secret(&self.password) {
+            match protect(&self.password) {
                 Ok(stored) => stored,
                 Err(err) => {
-                    // Nothing is written for the password rather than writing it
-                    // unprotected: every other setting still persists, and the
-                    // UI says why the field will be empty after a restart.
                     self.warning = Some(format!("пароль не сохранён: {err}"));
+                    // On the supported platform a temporary DPAPI failure must
+                    // not replace the previous settings with an empty password.
+                    #[cfg(windows)]
+                    return Err(format!("не удалось защитить пароль; настройки не изменены: {err}"));
+                    #[cfg(not(windows))]
                     String::new()
                 }
             }
@@ -561,6 +573,20 @@ mod tests {
         let back: Config = serde_json::from_str(&raw).unwrap();
         assert!(back.password.is_empty());
         assert_eq!(back.volume, 0.5);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protection_failure_keeps_the_previous_settings() {
+        let path = std::env::temp_dir().join(format!("beat-protect-failure-{}.json", std::process::id()));
+        let original = b"previous encrypted settings";
+        std::fs::write(&path, original).unwrap();
+        let mut cfg = Config { password: "new secret".into(), ..Config::default() };
+        let result = cfg.save_to_with(&path, |_| Err("DPAPI unavailable".into()));
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(cfg.warning.is_some());
         std::fs::remove_file(path).unwrap();
     }
 

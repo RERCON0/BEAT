@@ -56,12 +56,12 @@ pub fn file_key(rel: &str, path: &Path, px: u32) -> Option<String> {
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    Some(format!("square-v1:file:{rel}:{}:{mtime}:{px}", meta.len()))
+    Some(format!("square-v2:file:{}:{rel}:{}:{mtime}:{px}", path.to_string_lossy(), meta.len()))
 }
 
 /// Cache key for a server cover id at a given thumbnail size.
-pub fn server_key(cover_id: &str, px: u32) -> String {
-    format!("square-v1:cover:{cover_id}:{px}")
+pub fn server_key(server: &str, cover_id: &str, px: u32) -> String {
+    format!("square-v2:cover:{server}:{cover_id}:{px}")
 }
 
 /// Decoded thumbnail from the cache, if this exact key was stored before.
@@ -72,11 +72,17 @@ pub fn load(key: &str) -> Option<ColorImage> {
 pub fn load_in(dir: &Path, key: &str) -> Option<ColorImage> {
     let path = file_for(dir, key);
     guarded(|| {
-        let meta = std::fs::metadata(&path).ok()?;
+        use std::io::Read;
+        let file = std::fs::File::open(&path).ok()?;
+        let meta = file.metadata().ok()?;
         if meta.len() > MAX_FILE_BYTES {
             return None;
         }
-        let bytes = std::fs::read(&path).ok()?;
+        let mut bytes = Vec::new();
+        file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes).ok()?;
+        if bytes.len() as u64 > MAX_FILE_BYTES {
+            return None;
+        }
         let mut reader = image::ImageReader::with_format(std::io::Cursor::new(&bytes), image::ImageFormat::Png);
         reader.limits(cache_limits());
         let decoded = reader.decode().ok()?.to_rgba8();
@@ -107,7 +113,7 @@ pub fn store(key: &str, image: &ColorImage) -> Option<PathBuf> {
 
 pub fn store_in(dir: &Path, key: &str, image: &ColorImage) -> Option<PathBuf> {
     let (width, height) = (image.size[0], image.size[1]);
-    if width == 0 || height == 0 || width as u32 > MAX_STORED_SIDE || height as u32 > MAX_STORED_SIDE {
+    if width == 0 || height == 0 || width > MAX_STORED_SIDE as usize || height > MAX_STORED_SIDE as usize {
         return None;
     }
     guarded(|| {
@@ -134,6 +140,15 @@ fn prune_to(dir: &Path, max_files: usize, max_bytes: u64) {
     let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
         .flatten()
         .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let stem = name.strip_suffix(".png")?;
+            if stem.len() != 32 || !stem.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            if !entry.file_type().ok()?.is_file() {
+                return None;
+            }
             let meta = entry.metadata().ok()?;
             if !meta.is_file() {
                 return None;
@@ -142,7 +157,7 @@ fn prune_to(dir: &Path, max_files: usize, max_bytes: u64) {
             Some((modified, meta.len(), entry.path()))
         })
         .collect();
-    let total: u64 = files.iter().map(|(_, len, _)| *len).sum();
+    let total: u64 = files.iter().fold(0u64, |total, (_, len, _)| total.saturating_add(*len));
     if files.len() <= max_files && total <= max_bytes {
         return;
     }
@@ -179,6 +194,18 @@ fn guarded<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pruning_leaves_files_that_are_not_managed_thumbnails_untouched() {
+        let dir = temp_dir("owned-only");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("personal.png"), b"keep").unwrap();
+        std::fs::write(dir.join(format!("{:032x}.png", 1)), b"managed").unwrap();
+        prune_to(&dir, 0, 0);
+        assert_eq!(std::fs::read(dir.join("personal.png")).unwrap(), b"keep");
+        assert!(!dir.join(format!("{:032x}.png", 1)).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn temp_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "beat-covers-{tag}-{}-{}",
@@ -208,8 +235,14 @@ mod tests {
         let path = dir.join("a.mp3");
         std::fs::write(&path, b"one").unwrap();
         let first = file_key("a.mp3", &path, 96).unwrap();
-        assert!(first.starts_with("square-v1:file:"), "old rectangular thumbnails must be regenerated");
-        assert_eq!(server_key("album-1", 96), "square-v1:cover:album-1:96");
+        assert!(first.starts_with("square-v2:file:"), "old thumbnails must be regenerated");
+        assert_ne!(server_key("server-a", "album-1", 96), server_key("server-b", "album-1", 96));
+        let other = dir.join("other").join("a.mp3");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::copy(&path, &other).unwrap();
+        let timestamps = std::fs::FileTimes::new().set_modified(std::fs::metadata(&path).unwrap().modified().unwrap());
+        std::fs::File::options().write(true).open(&other).unwrap().set_times(timestamps).unwrap();
+        assert_ne!(file_key("a.mp3", &path, 96), file_key("a.mp3", &other, 96));
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&path, b"a longer payload").unwrap();
         let second = file_key("a.mp3", &path, 96).unwrap();
@@ -240,7 +273,7 @@ mod tests {
         let dir = temp_dir("prune");
         std::fs::create_dir_all(&dir).unwrap();
         for index in 0..6 {
-            std::fs::write(dir.join(format!("{index}.png")), b"x").unwrap();
+            std::fs::write(dir.join(format!("{index:032x}.png")), b"x").unwrap();
             std::thread::sleep(std::time::Duration::from_millis(15));
         }
         prune_to(&dir, 3, u64::MAX);
@@ -250,7 +283,7 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        assert!(names.contains(&"5.png".to_owned()), "the newest file was pruned: {names:?}");
+        assert!(names.contains(&format!("{:032x}.png", 5)), "the newest file was pruned: {names:?}");
         assert!(names.len() <= 3, "file cap not enforced: {names:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -260,7 +293,7 @@ mod tests {
         let dir = temp_dir("prune-size");
         std::fs::create_dir_all(&dir).unwrap();
         for index in 0..6 {
-            std::fs::write(dir.join(format!("{index}.png")), vec![0u8; 100]).unwrap();
+            std::fs::write(dir.join(format!("{index:032x}.png")), vec![0u8; 100]).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(15));
         }
         prune_to(&dir, usize::MAX, 300);

@@ -73,5 +73,6 @@ jobs:
             dist/beat.exe
             dist/BUILD.json
             dist/SHA256SUMS.txt
+            dist/COMPONENT-NOTICES.txt
           if-no-files-found: error
           retention-days: 7

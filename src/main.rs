@@ -9,6 +9,8 @@ mod catalog;
 mod config;
 mod covers;
 mod local;
+mod media;
+mod opus;
 mod player;
 mod session;
 mod stats;
@@ -69,6 +71,7 @@ enum LibEvent {
     Disk(u64, Vec<CachedTrack>, Vec<LocalTrack>),
     /// Cheap local count walk: (track count, bytes).
     LocalStats(u64, (usize, u64)),
+    LibrarySaved(String, Result<(), String>),
 }
 
 enum CoverEvent {
@@ -154,9 +157,9 @@ struct BeatApp {
     view: View,
     album_list_title: String,
     artists: Vec<api::Artist>,
-    album_list: Vec<api::Album>,
-    artist_open: Option<(api::Artist, Vec<api::Album>)>,
-    album_open: Option<(api::Album, Vec<api::Song>)>,
+    album_list: Arc<Vec<api::Album>>,
+    artist_open: Option<(api::Artist, Arc<Vec<api::Album>>)>,
+    album_open: Option<(api::Album, Arc<Vec<api::Song>>)>,
     /// Everything on disk: downloaded cache entries plus hand-dropped local
     /// files found in the cache folder.
     disk_entries: Arc<Vec<DiskEntry>>,
@@ -164,6 +167,7 @@ struct BeatApp {
     /// or the on-disk cache), and the buffer of the scan in progress.
     server_songs: Arc<Vec<api::Song>>,
     library_pending: Vec<api::Song>,
+    library_save_pending: bool,
     /// Merged, de-duplicated rows of the library view (server + disk).
     library_rows: Arc<Vec<LibRow>>,
     /// Filter text and its cached result, so the library list is not
@@ -174,6 +178,7 @@ struct BeatApp {
     /// Hand-dropped files grouped into albums/artists, so the library sections
     /// work with local music even without a server.
     local_albums: Arc<Vec<LocalAlbum>>,
+    local_album_cards: Arc<Vec<api::Album>>,
     local_artists: Arc<Vec<api::Artist>>,
     /// Server artists as fetched; `artists` is the combined view list.
     artists_server: Vec<api::Artist>,
@@ -188,6 +193,7 @@ struct BeatApp {
     /// When the session file was last written; bursts of track changes are
     /// throttled so holding «next» does not hammer the disk.
     session_saved_at: std::time::Instant,
+    session_store: session::Store,
     frequent_entries: Arc<Vec<(DiskEntry, u64)>>,
     frequent_dirty: bool,
     /// Request id of the in-flight cache-folder scan.
@@ -221,6 +227,7 @@ struct BeatApp {
     cover_pending: HashSet<String>,
     cover_failed: VecDeque<String>,
     cover_generation: u64,
+    disk_cover_generation: u64,
     /// Cover jobs (fetch or extraction) running right now.
     cover_inflight: usize,
     dl_tx: Sender<(String, DlEvent)>,
@@ -244,9 +251,11 @@ struct BeatApp {
     shuffle_order: Vec<usize>,
     shuffle_pos: usize,
     play_error: Option<String>,
-    /// Furthest position the current source reached. A track that decodes but
-    /// produces no audio never advances it, which keeps it out of the counters.
+    /// Time the current source advanced while playing, excluding pauses and
+    /// instantaneous position changes from seeking.
     played_secs: f64,
+    listen_position: f64,
+    listen_checked_at: std::time::Instant,
     /// Position picked on the seek slider, sent when the pointer is released.
     pending_seek: Option<f64>,
     /// Last user-visible message (downloads, cache, playback).
@@ -270,7 +279,8 @@ impl BeatApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let cfg = Config::load();
         theme::apply(&cc.egui_ctx, cfg.dark_mode);
-        let cache = Cache::load(cfg.cache_root());
+        let profile = api::Server::from_config(&cfg).catalog_key();
+        let cache = Cache::load_profile(cfg.cache_root(), profile.as_deref(), true);
         let player = match player::Player::new(cfg.volume) {
             Ok(player) => Some(player),
             Err(err) => {
@@ -292,24 +302,27 @@ impl BeatApp {
             view: View::Albums,
             album_list_title: "НОВЫЕ АЛЬБОМЫ".into(),
             artists: Vec::new(),
-            album_list: Vec::new(),
+            album_list: Arc::new(Vec::new()),
             artist_open: None,
             album_open: None,
             disk_entries: Arc::new(Vec::new()),
             server_songs: Arc::new(Vec::new()),
             library_pending: Vec::new(),
+            library_save_pending: false,
             library_rows: Arc::new(Vec::new()),
             library_filter: String::new(),
             library_filter_applied: String::new(),
             library_filtered: Arc::new(Vec::new()),
             local_albums: Arc::new(Vec::new()),
+            local_album_cards: Arc::new(Vec::new()),
             local_artists: Arc::new(Vec::new()),
             artists_server: Vec::new(),
             search_local: Arc::new(Vec::new()),
             search_local_key: (String::new(), 0, 0),
-            stats: stats::Stats::load(),
+            stats: stats::Stats::load_scoped(profile_key(&cfg)),
             counted_current: None,
             session_saved_at: std::time::Instant::now() - std::time::Duration::from_secs(10),
+            session_store: session::Store::new(),
             frequent_entries: Arc::new(Vec::new()),
             frequent_dirty: false,
             disk_scan_id: None,
@@ -335,6 +348,7 @@ impl BeatApp {
             cover_pending: HashSet::new(),
             cover_failed: VecDeque::new(),
             cover_generation: 0,
+            disk_cover_generation: 0,
             cover_inflight: 0,
             dl_tx,
             dl_rx,
@@ -353,6 +367,8 @@ impl BeatApp {
             shuffle_pos: 0,
             play_error: None,
             played_secs: 0.0,
+            listen_position: 0.0,
+            listen_checked_at: std::time::Instant::now(),
             pending_seek: None,
             notice: None,
             save_error: None,
@@ -370,7 +386,7 @@ impl BeatApp {
             #[cfg(windows)]
             maximized: false,
         };
-        app.notice = app.cache.warning();
+        app.notice = app.cache.take_warning().or_else(|| app.stats.take_warning());
         app.restore_session();
         app.ping_server();
         app.refresh_local_stats();
@@ -422,9 +438,15 @@ impl BeatApp {
     /// Brings back the last track, queue, shuffle and repeat; playback itself
     /// never starts by itself.
     fn restore_session(&mut self) {
-        let session = session::load();
+        let (session, warning) = self.session_store.load();
+        if warning.is_some() {
+            self.notice = warning;
+        }
         self.shuffle = session.shuffle;
         self.repeat = session.repeat;
+        if !session.source.is_empty() && session.source != profile_key(&self.cfg) {
+            return;
+        }
         self.play_queue = session.queue;
         self.play_index = session.index.min(self.play_queue.len().saturating_sub(1));
         self.current = session.song;
@@ -436,13 +458,16 @@ impl BeatApp {
     /// Persists the playback state; also called on exit.
     fn save_session(&mut self) {
         self.session_saved_at = std::time::Instant::now();
-        session::save(&session::Session {
-            song: self.current.clone(),
-            queue: self.play_queue.clone(),
+        if let Err(error) = self.session_store.save(session::State {
+            source: &profile_key(&self.cfg),
+            song: &self.current,
+            queue: &self.play_queue,
             index: self.play_index,
             shuffle: self.shuffle,
             repeat: self.repeat,
-        });
+        }) {
+            self.notice = Some(error);
+        }
     }
 
     /// Track changes can come in bursts (holding «next»): writes are
@@ -560,6 +585,7 @@ impl BeatApp {
     fn rebuild_local_library(&mut self) {
         let albums = build_local_albums(&self.disk_entries);
         self.local_artists = Arc::new(build_local_artists(&albums));
+        self.local_album_cards = Arc::new(albums.iter().map(LocalAlbum::to_api_album).collect());
         self.local_albums = Arc::new(albums);
         self.rebuild_artists_view();
     }
@@ -586,7 +612,7 @@ impl BeatApp {
             } else {
                 "ЛОКАЛЬНЫЕ АЛЬБОМЫ"
             };
-            self.album_list = albums;
+            self.album_list = Arc::new(albums);
             self.album_list_title = local_title.to_owned();
             self.view = View::Albums;
             self.loading = None;
@@ -630,14 +656,14 @@ impl BeatApp {
                 .collect();
             self.loading = None;
             self.view = View::Artist;
-            self.artist_open = Some((artist, albums));
+            self.artist_open = Some((artist, Arc::new(albums)));
             return;
         }
         let Some(client) = self.require_client() else { return };
         let id = self.request_id();
         self.loading = Some(id);
         self.view = View::Artist;
-        self.artist_open = Some((artist.clone(), Vec::new()));
+        self.artist_open = Some((artist.clone(), Arc::new(Vec::new())));
         let tx = self.lib_tx.clone();
         std::thread::spawn(move || {
             let result = client.artist(&artist.id);
@@ -666,7 +692,7 @@ impl BeatApp {
             Some(local) => {
                 self.view = View::Album;
                 self.loading = None;
-                self.album_open = Some((album.clone(), local.songs.clone()));
+                self.album_open = Some((album.clone(), Arc::new(local.songs.clone())));
             }
             None => self.notice = Some("альбом не найден — обновите список на диске".into()),
         }
@@ -678,7 +704,7 @@ impl BeatApp {
         let id = self.request_id();
         self.loading = Some(id);
         self.view = View::Album;
-        self.album_open = Some((album.clone(), Vec::new()));
+        self.album_open = Some((album.clone(), Arc::new(Vec::new())));
         let tx = self.lib_tx.clone();
         std::thread::spawn(move || {
             let result = client.album(&album.id);
@@ -808,13 +834,33 @@ impl BeatApp {
             self.play_queue.clear();
             self.shuffle_order.clear();
             self.pending_seek = None;
+            self.library_pending.clear();
+            self.set_server_songs(Vec::new());
         }
         self.cfg = next;
+        self.stats.set_scope(profile_key(&self.cfg));
         if let Some(warning) = self.cfg.warning.clone() {
             self.notice = Some(warning);
         }
         self.client = Self::build_client(&self.cfg);
-        self.cache = self.cache.for_root(self.cfg.cache_root());
+        if source_changed {
+            if let Some(client) = &self.client {
+                match catalog::load_library(client) {
+                    Ok(songs) => self.set_server_songs(songs),
+                    Err(err) => self.notice = Some(err),
+                }
+            }
+        }
+        let profile = api::Server::from_config(&self.cfg).catalog_key();
+        self.cache = self.cache.for_profile(self.cfg.cache_root(), profile.as_deref());
+        if let Some(warning) = self.cache.take_warning() {
+            self.notice = Some(warning);
+        }
+        if source_changed {
+            self.disk_scan_id = None;
+            self.local_stats_request = None;
+            self.save_session();
+        }
         self.cover_generation = self.cover_generation.wrapping_add(1);
         self.covers.clear();
         self.cover_order.clear();
@@ -837,7 +883,7 @@ impl BeatApp {
         self.album_open = None;
         self.artist_open = None;
         self.search_result = None;
-        self.album_list.clear();
+        self.album_list = Arc::new(Vec::new());
         self.artists_server.clear();
         self.rebuild_artists_view();
         self.search_local = Arc::new(Vec::new());
@@ -873,7 +919,7 @@ impl BeatApp {
     }
 
     fn start_catalog_scan(&mut self, mode: catalog::Mode) {
-        if self.catalog_scan.is_some() {
+        if self.catalog_scan.is_some() || (mode == catalog::Mode::Library && self.library_save_pending) {
             return;
         }
         let Some(client) = self.require_client() else { return };
@@ -926,10 +972,11 @@ impl BeatApp {
                 self.notice = Some(format!("библиотека обновлена: {count} треков с сервера"));
                 if let Some(client) = self.client.clone() {
                     let songs = self.server_songs.clone();
+                    let tx = self.lib_tx.clone();
+                    self.library_save_pending = true;
                     std::thread::spawn(move || {
-                        if let Err(err) = catalog::save_library(&client, &songs) {
-                            eprintln!("beat: {err}");
-                        }
+                        let result = catalog::save_library(&client, &songs);
+                        let _ = tx.send(LibEvent::LibrarySaved(client.catalog_key(), result));
                     });
                 }
             }
@@ -1031,6 +1078,14 @@ impl BeatApp {
     fn pump_library(&mut self) {
         while let Ok(event) = self.lib_rx.try_recv() {
             match event {
+                LibEvent::LibrarySaved(profile, result) => {
+                    self.library_save_pending = false;
+                    if self.client.as_ref().is_some_and(|client| client.catalog_key() == profile) {
+                        if let Err(error) = result {
+                            self.notice = Some(error);
+                        }
+                    }
+                }
                 LibEvent::Check(id, result) => {
                     if self.check_request == Some(id) {
                         self.check_request = None;
@@ -1059,7 +1114,7 @@ impl BeatApp {
                         continue;
                     }
                     match result {
-                        Ok((artist, albums)) => self.artist_open = Some((artist, albums)),
+                        Ok((artist, albums)) => self.artist_open = Some((artist, Arc::new(albums))),
                         Err(err) => self.notice = Some(err),
                     }
                 }
@@ -1077,7 +1132,7 @@ impl BeatApp {
                             if download {
                                 self.pending_download = None;
                             }
-                            self.album_open = Some((album, songs.clone()));
+                            self.album_open = Some((album, Arc::new(songs.clone())));
                             if play {
                                 if let Some(first) = songs.first() {
                                     self.play_song(first.clone(), songs.clone(), 0);
@@ -1103,7 +1158,7 @@ impl BeatApp {
                     }
                     match result {
                         Ok(albums) => {
-                            self.album_list = albums;
+                            self.album_list = Arc::new(albums);
                             self.view = View::Albums;
                         }
                         Err(err) => self.notice = Some(err),
@@ -1125,8 +1180,10 @@ impl BeatApp {
                         continue;
                     }
                     self.disk_scan_id = None;
+                    self.disk_cover_generation = self.disk_cover_generation.wrapping_add(1);
                     self.local_stats_request = None;
-                    self.local_stats = (local.len(), local.iter().map(|track| track.size).sum());
+                    self.local_stats =
+                        (local.len(), local.iter().fold(0u64, |bytes, track| bytes.saturating_add(track.size)));
                     self.set_disk_entries(merge_disk_entries(indexed, local));
                     // Local album mode opened before the first scan finished:
                     // fill the grid now that the folder is known.
@@ -1135,7 +1192,7 @@ impl BeatApp {
                         && self.album_list.is_empty()
                         && !self.local_albums.is_empty()
                     {
-                        self.album_list = self.local_albums.iter().map(LocalAlbum::to_api_album).collect();
+                        self.album_list = self.local_album_cards.clone();
                         self.album_list_title = "ЛОКАЛЬНЫЕ АЛЬБОМЫ".into();
                     }
                     if self.disk_stale {
@@ -1194,6 +1251,12 @@ impl BeatApp {
     }
 
     fn pump_downloads(&mut self) {
+        if let Some(warning) = self.cache.take_warning() {
+            self.notice = Some(warning);
+        }
+        if let Some(warning) = self.stats.take_warning() {
+            self.notice = Some(warning);
+        }
         while let Ok((id, event)) = self.dl_rx.try_recv() {
             match event {
                 DlEvent::Done(entry) => {
@@ -1379,6 +1442,8 @@ impl BeatApp {
         }
         self.counted_current = None;
         self.played_secs = 0.0;
+        self.listen_position = 0.0;
+        self.listen_checked_at = std::time::Instant::now();
         self.pending_seek = None;
         self.play_state = PlayState::Idle;
         self.play_error = None;
@@ -1455,7 +1520,11 @@ impl BeatApp {
     }
 
     fn start_playback_download(&mut self, song: api::Song) -> Option<DlHandle> {
-        let client = self.client.clone()?;
+        let Some(client) = self.client.clone() else {
+            self.play_error = Some("трек не скачан; настройте подключение к серверу".into());
+            self.play_state = PlayState::Idle;
+            return None;
+        };
         let label = format_label(self.cfg.stream_format);
         let handle =
             cache::start_download((*client).clone(), self.cache.clone(), song.clone(), label, self.dl_tx.clone());
@@ -1476,12 +1545,17 @@ impl BeatApp {
         }
         // How far the source really got: a valid header over zero samples never
         // advances it, and such a track must not be counted at all.
-        if !self.player.as_ref().map(|player| player.is_paused()).unwrap_or(true) {
-            let position = self.player.as_ref().map(|player| player.position()).unwrap_or(0.0);
-            if position.is_finite() && position > self.played_secs {
-                self.played_secs = position;
-            }
-        }
+        let paused = self.player.as_ref().map(|player| player.is_paused()).unwrap_or(true);
+        let position = self.player.as_ref().map(|player| player.position()).unwrap_or(0.0);
+        let now = std::time::Instant::now();
+        self.played_secs += listen_advance(
+            self.listen_position,
+            position,
+            now.duration_since(self.listen_checked_at).as_secs_f64(),
+            paused,
+        );
+        self.listen_position = position;
+        self.listen_checked_at = now;
         if self.played_secs < MIN_LISTEN_SECS {
             return;
         }
@@ -1645,6 +1719,7 @@ impl BeatApp {
             self.ping_request.is_some(),
             self.cover_inflight > 0,
             self.catalog_scan.is_some(),
+            self.library_save_pending,
         ]
         .into_iter()
         .filter(|running| *running)
@@ -1830,8 +1905,8 @@ impl BeatApp {
                             }
                         }
                     }
-                    // The same listen continues: do not count it again.
-                    self.counted_current = Some(song.id);
+                    // Keep the listen marker, including a track which had not
+                    // played for a full second before its output disappeared.
                     self.play_state = PlayState::Playing;
                     return;
                 }
@@ -1857,7 +1932,11 @@ impl BeatApp {
         // The same artwork is drawn at two sizes (24 px list rows, 168 px album
         // cards), so the in-memory key carries the requested size: one texture
         // cannot serve both, and sharing the small one would upscale it.
-        let key = format!("{cover_id}#{px}");
+        let key = if cover_id.starts_with(FILE_COVER_PREFIX) {
+            format!("{cover_id}#{px}#{}", self.disk_cover_generation)
+        } else {
+            format!("{cover_id}#{px}")
+        };
         if let Some(texture) = self.covers.get(&key) {
             return Some(texture.clone());
         }
@@ -1904,7 +1983,7 @@ impl BeatApp {
             let generation = self.cover_generation;
             let cover_id = cover_id.to_owned();
             std::thread::spawn(move || {
-                let cache_key = covers::server_key(&cover_id, px);
+                let cache_key = covers::server_key(&client.catalog_key(), &cover_id, px);
                 let image = covers::load(&cache_key).or_else(|| {
                     let image = client.cover_bytes(&cover_id, px).ok().and_then(|bytes| decode_cover_sized(&bytes, px));
                     if let Some(image) = &image {
@@ -2177,7 +2256,7 @@ impl BeatApp {
             theme::kv_row(ui, "треков", &format!("{}", cached + local), theme::text());
             theme::kv_row(ui, "в кеше", &format!("{cached}"), theme::dim());
             theme::kv_row(ui, "локальных", &format!("{local}"), theme::dim());
-            theme::kv_row(ui, "размер", &human_size(cached_bytes + local_bytes), theme::text());
+            theme::kv_row(ui, "размер", &human_size(cached_bytes.saturating_add(local_bytes)), theme::text());
             ui.add_space(4.0);
             if ui.add_sized([ui.available_width(), 26.0], egui::Button::new("открыть папку кеша")).clicked()
             {
@@ -2198,13 +2277,22 @@ impl BeatApp {
                 .clicked();
             if clear_clicked {
                 if self.cache_clear_armed {
+                    if self.current.as_ref().is_some_and(|song| !local::is_local_id(&song.id)) {
+                        self.stop_playback();
+                    }
                     match self.cache.clear() {
                         Ok(()) => self.notice = Some("кеш очищен".into()),
                         Err(err) => self.notice = Some(err),
                     }
                     self.cache_clear_armed = false;
-                    self.set_disk_entries(Vec::new());
-                    self.refresh_local_stats();
+                    let kept = self
+                        .disk_entries
+                        .iter()
+                        .filter(|entry| entry.is_local() || self.cache.is_indexed(entry.id()))
+                        .cloned()
+                        .collect();
+                    self.set_disk_entries(kept);
+                    self.refresh_disk();
                 } else {
                     self.cache_clear_armed = true;
                 }
@@ -2477,13 +2565,12 @@ impl BeatApp {
         self.ui_album_grid(ui, "", Some(albums));
     }
 
-    fn ui_album_grid(&mut self, ui: &mut egui::Ui, title: &str, albums: Option<Vec<api::Album>>) {
+    fn ui_album_grid(&mut self, ui: &mut egui::Ui, title: &str, albums: Option<Arc<Vec<api::Album>>>) {
         // In server mode hand-dropped albums get their own section below the
         // server grid, so the library buttons cover local music too.
         let show_local = albums.is_none() && self.client.is_some();
         let primary = albums.unwrap_or_else(|| self.album_list.clone());
-        let local_extra: Vec<api::Album> =
-            if show_local { self.local_albums.iter().map(LocalAlbum::to_api_album).collect() } else { Vec::new() };
+        let local_extra = if show_local { self.local_album_cards.clone() } else { Arc::new(Vec::new()) };
         if self.loading.is_some() && primary.is_empty() && local_extra.is_empty() {
             ui.label(egui::RichText::new("загрузка…").size(12.0).color(theme::faint()));
             return;
@@ -2523,34 +2610,30 @@ impl BeatApp {
         let mut download = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if !primary.is_empty() {
-                album_grid(ui, |ui| {
-                    for album in &primary {
-                        let card = album_card(
-                            ui,
-                            album,
-                            self.cover_texture_of(&album.cover_id, COVER_PX),
-                            !album.id.starts_with(LOCAL_ALBUM_PREFIX),
-                        );
-                        match card {
-                            AlbumCardAction::Open => open = Some(album.clone()),
-                            AlbumCardAction::Play => play = Some(album.clone()),
-                            AlbumCardAction::Download => download = Some(album.clone()),
-                            AlbumCardAction::None => {}
-                        }
+                visible_album_grid(ui, "primary-albums", &primary, |ui, album| {
+                    let card = album_card(
+                        ui,
+                        album,
+                        self.cover_texture_of(&album.cover_id, COVER_PX),
+                        !album.id.starts_with(LOCAL_ALBUM_PREFIX),
+                    );
+                    match card {
+                        AlbumCardAction::Open => open = Some(album.clone()),
+                        AlbumCardAction::Play => play = Some(album.clone()),
+                        AlbumCardAction::Download => download = Some(album.clone()),
+                        AlbumCardAction::None => {}
                     }
                 });
             }
             if !local_extra.is_empty() {
                 theme::section_label(ui, "ЛОКАЛЬНЫЕ АЛЬБОМЫ");
-                album_grid(ui, |ui| {
-                    for album in &local_extra {
-                        let card = album_card(ui, album, self.cover_texture_of(&album.cover_id, COVER_PX), false);
-                        match card {
-                            AlbumCardAction::Open => open = Some(album.clone()),
-                            AlbumCardAction::Play => play = Some(album.clone()),
-                            AlbumCardAction::Download => download = Some(album.clone()),
-                            AlbumCardAction::None => {}
-                        }
+                visible_album_grid(ui, "local-albums", &local_extra, |ui, album| {
+                    let card = album_card(ui, album, self.cover_texture_of(&album.cover_id, COVER_PX), false);
+                    match card {
+                        AlbumCardAction::Open => open = Some(album.clone()),
+                        AlbumCardAction::Play => play = Some(album.clone()),
+                        AlbumCardAction::Download => download = Some(album.clone()),
+                        AlbumCardAction::None => {}
                     }
                 });
             }
@@ -2597,7 +2680,7 @@ impl BeatApp {
             );
             if ui.add(theme::accent_button("[ СЛУШАТЬ ]")).clicked() {
                 if let Some(song) = songs.first() {
-                    self.play_song(song.clone(), songs.clone(), 0);
+                    self.play_song(song.clone(), songs.as_ref().clone(), 0);
                 }
             }
             if !album.id.starts_with(LOCAL_ALBUM_PREFIX) && ui.button("[ СКАЧАТЬ АЛЬБОМ ]").clicked() {
@@ -2641,7 +2724,7 @@ impl BeatApp {
                         ui.add_space(38.0);
                     }
                     if ui.add_enabled(self.player.is_some(), egui::Button::new("▶")).clicked() {
-                        self.play_song(song.clone(), songs.clone(), index);
+                        self.play_song(song.clone(), songs.as_ref().clone(), index);
                     }
                     if !local_song
                         && ui.add_enabled(!cached, egui::Button::new("↓")).on_hover_text("скачать в кеш").clicked()
@@ -2658,7 +2741,7 @@ impl BeatApp {
             if let Some(local) = self.local_albums.iter().find(|local| local.id == album.id) {
                 let songs = local.songs.clone();
                 if let Some(first) = songs.first() {
-                    self.album_open = Some((album, songs.clone()));
+                    self.album_open = Some((album, Arc::new(songs.clone())));
                     self.play_song(first.clone(), songs, 0);
                 }
             }
@@ -2667,7 +2750,7 @@ impl BeatApp {
         if self.album_open.as_ref().is_some_and(|(open, _)| open.id == album.id) {
             let songs = self.album_open.as_ref().map(|(_, songs)| songs.clone()).unwrap_or_default();
             if let Some(first) = songs.first() {
-                self.play_song(first.clone(), songs.clone(), 0);
+                self.play_song(first.clone(), songs.as_ref().clone(), 0);
             }
         } else {
             self.pending_download = None;
@@ -3341,6 +3424,45 @@ enum AlbumCardAction {
 
 /// Outer width of one album card; fixed so the grid packs whole rows.
 const ALBUM_CARD_WIDTH: f32 = 184.0;
+const ALBUM_CARD_HEIGHT: f32 = 280.0;
+
+/// Reserve the full scroll range, but lay out cards and request artwork only
+/// for rows intersecting the viewport. Large local libraries stay responsive.
+fn visible_album_grid(
+    ui: &mut egui::Ui,
+    id: &str,
+    albums: &[api::Album],
+    mut card: impl FnMut(&mut egui::Ui, &api::Album),
+) {
+    if albums.is_empty() {
+        return;
+    }
+    let gap = 12.0;
+    let width = ui.available_width();
+    let columns = ((width + gap) / (ALBUM_CARD_WIDTH + gap)).floor().max(1.0) as usize;
+    let rows = albums.len().div_ceil(columns);
+    let stride = ALBUM_CARD_HEIGHT + gap;
+    let height = rows as f32 * stride - gap;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let clip = ui.clip_rect();
+    let start = (((clip.top() - rect.top()) / stride).floor().max(0.0) as usize).min(rows);
+    let end = (((clip.bottom() - rect.top()) / stride).ceil().max(0.0) as usize).min(rows);
+    for row in start..end {
+        let row_rect = egui::Rect::from_min_size(
+            rect.min + egui::vec2(0.0, row as f32 * stride),
+            egui::vec2(width, ALBUM_CARD_HEIGHT),
+        );
+        ui.allocate_new_ui(egui::UiBuilder::new().id_salt((id, row)).max_rect(row_rect), |ui| {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                let start = row * columns;
+                for album in &albums[start..(start + columns).min(albums.len())] {
+                    card(ui, album);
+                }
+            });
+        });
+    }
+}
 
 /// Wrapped grid of album cards. `horizontal_wrapped` centers items on the
 /// cross axis, so cards of different heights end up at different tops; this
@@ -3363,62 +3485,71 @@ fn album_card(
     // without running the wrap decision, and the row runs off the panel.
     // Allocating a fixed-width vertical slot first gives the grid an item it
     // can wrap into rows; the frame then draws inside that slot.
-    ui.allocate_ui_with_layout(egui::vec2(ALBUM_CARD_WIDTH, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-        egui::Frame::none().stroke(egui::Stroke::new(1.0, theme::line())).inner_margin(egui::Margin::same(8.0)).show(
-            ui,
-            |ui| {
-                ui.set_width(168.0);
-                let (rect, response) = ui.allocate_exact_size(egui::vec2(168.0, 168.0), egui::Sense::click());
-                match cover {
-                    Some(texture) => {
-                        ui.painter().image(texture.id(), rect, square_cover_uv(texture.size()), egui::Color32::WHITE);
+    ui.allocate_ui_with_layout(
+        egui::vec2(ALBUM_CARD_WIDTH, ALBUM_CARD_HEIGHT),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            egui::Frame::none()
+                .stroke(egui::Stroke::new(1.0, theme::line()))
+                .inner_margin(egui::Margin::same(8.0))
+                .show(ui, |ui| {
+                    ui.set_width(168.0);
+                    let (rect, response) = ui.allocate_exact_size(egui::vec2(168.0, 168.0), egui::Sense::click());
+                    match cover {
+                        Some(texture) => {
+                            ui.painter().image(
+                                texture.id(),
+                                rect,
+                                square_cover_uv(texture.size()),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                        None => {
+                            ui.painter().rect_filled(rect, 0.0, theme::field());
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "♪",
+                                egui::FontId::proportional(36.0),
+                                theme::faint(),
+                            );
+                        }
                     }
-                    None => {
-                        ui.painter().rect_filled(rect, 0.0, theme::field());
-                        ui.painter().text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "♪",
-                            egui::FontId::proportional(36.0),
-                            theme::faint(),
+                    if response.clicked() {
+                        action = AlbumCardAction::Open;
+                    }
+                    if response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    ui.add_space(4.0);
+                    // Fixed-height single-line rows: cards with different
+                    // titles must keep the same height, or the wrapped grid
+                    // turns into a staircase.
+                    let text_row = |ui: &mut egui::Ui, text: &str, size: f32, color: egui::Color32| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(168.0, size + 5.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add(egui::Label::new(egui::RichText::new(text).size(size).color(color)).truncate());
+                            },
                         );
-                    }
-                }
-                if response.clicked() {
-                    action = AlbumCardAction::Open;
-                }
-                if response.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                ui.add_space(4.0);
-                // Fixed-height single-line rows: cards with different
-                // titles must keep the same height, or the wrapped grid
-                // turns into a staircase.
-                let text_row = |ui: &mut egui::Ui, text: &str, size: f32, color: egui::Color32| {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(168.0, size + 5.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.add(egui::Label::new(egui::RichText::new(text).size(size).color(color)).truncate());
-                        },
-                    );
-                };
-                text_row(ui, &clip(&album.name, 30), 12.0, theme::text());
-                text_row(ui, &clip(&album.artist, 30), 10.0, theme::faint());
-                ui.horizontal(|ui| {
-                    if ui.button("▶").on_hover_text("слушать").clicked() {
-                        action = AlbumCardAction::Play;
-                    }
-                    if can_download && ui.button("↓").on_hover_text("скачать альбом").clicked() {
-                        action = AlbumCardAction::Download;
-                    }
-                    if album.year > 0 {
-                        ui.label(egui::RichText::new(format!("{}", album.year)).size(10.0).color(theme::faint()));
-                    }
+                    };
+                    text_row(ui, &clip(&album.name, 30), 12.0, theme::text());
+                    text_row(ui, &clip(&album.artist, 30), 10.0, theme::faint());
+                    ui.horizontal(|ui| {
+                        if ui.button("▶").on_hover_text("слушать").clicked() {
+                            action = AlbumCardAction::Play;
+                        }
+                        if can_download && ui.button("↓").on_hover_text("скачать альбом").clicked() {
+                            action = AlbumCardAction::Download;
+                        }
+                        if album.year > 0 {
+                            ui.label(egui::RichText::new(format!("{}", album.year)).size(10.0).color(theme::faint()));
+                        }
+                    });
                 });
-            },
-        );
-    });
+        },
+    );
     action
 }
 
@@ -4000,6 +4131,21 @@ fn cached_to_song(entry: &CachedTrack) -> api::Song {
     }
 }
 
+fn profile_key(cfg: &Config) -> String {
+    use md5::{Digest, Md5};
+    let server = api::Server::from_config(cfg).catalog_key().unwrap_or_default();
+    format!("{:x}", Md5::digest(format!("{server}\0{}", cfg.cache_root().to_string_lossy())))
+}
+
+/// Seeking changes source position instantly; it must not manufacture minutes
+/// of listening. Paused time and backward seeks add nothing to the counter.
+fn listen_advance(previous: f64, position: f64, elapsed: f64, paused: bool) -> f64 {
+    if paused || !previous.is_finite() || !position.is_finite() || !elapsed.is_finite() {
+        return 0.0;
+    }
+    (position - previous).max(0.0).min(elapsed.max(0.0))
+}
+
 fn clip(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         text.to_owned()
@@ -4302,6 +4448,55 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seeking_and_pausing_do_not_manufacture_listens() {
+        let mut listened = 0.0;
+        let mut previous = 0.0;
+        for step in 1..=100 {
+            let position = step as f64 * 30.0;
+            listened += listen_advance(previous, position, 0.001, false);
+            previous = position;
+        }
+        assert!(listened < MIN_LISTEN_SECS, "rapid seeks counted as a listen");
+        listened += listen_advance(previous, previous + 10.0, 100.0, true);
+        assert!(listened < MIN_LISTEN_SECS, "paused time counted as a listen");
+        assert_eq!(listen_advance(previous, 0.0, 1.0, false), 0.0);
+        assert_eq!(listen_advance(0.0, 2.0, 2.0, false), 2.0);
+    }
+
+    #[test]
+    fn a_large_album_grid_draws_only_visible_cards_and_keeps_the_scroll_range() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, true);
+        let albums: Vec<_> =
+            (0..5000).map(|id| api::Album { id: id.to_string(), name: "Album".into(), ..Default::default() }).collect();
+        let mut drawn = 0;
+        let mut max_height = 0.0f32;
+        let mut content_height = 0.0;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 600.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let scroll = egui::ScrollArea::vertical().show(ui, |ui| {
+                        visible_album_grid(ui, "test-albums", &albums, |ui, album| {
+                            let start = ui.cursor().top();
+                            album_card(ui, album, None, true);
+                            max_height = max_height.max(ui.min_rect().bottom() - start);
+                            drawn += 1;
+                        });
+                    });
+                    content_height = scroll.content_size.y;
+                });
+            },
+        );
+        assert!(drawn > 0 && drawn <= 12, "laid out {drawn} of 5000 cards");
+        assert!(max_height <= ALBUM_CARD_HEIGHT + 1.0, "card height {max_height} exceeds its reserved row");
+        assert!(content_height > 400_000.0, "offscreen rows disappeared: {content_height}");
+    }
 
     #[test]
     fn time_and_size_formatting() {

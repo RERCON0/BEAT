@@ -18,9 +18,7 @@ use symphonia::core::probe::{Hint, ProbeResult};
 /// server ids.
 pub const LOCAL_ID_PREFIX: &str = "local:";
 
-// Opus is not in the decoder stack (rodio/symphonia), so `.opus` is skipped
-// rather than offered and then failing at playback.
-const AUDIO_EXTS: [&str; 8] = ["mp3", "flac", "ogg", "oga", "wav", "m4a", "aac", "mp4"];
+const AUDIO_EXTS: [&str; 11] = ["mp3", "flac", "ogg", "oga", "opus", "webm", "mka", "wav", "m4a", "aac", "mp4"];
 const MAX_DEPTH: usize = 8;
 const MAX_TRACKS: usize = 5000;
 /// How much of a hand-dropped file tag probing may read. Real tracks are far
@@ -41,7 +39,8 @@ struct ProbeSource {
 
 impl ProbeSource {
     fn new(path: &Path) -> Option<Self> {
-        let file = std::fs::File::open(path).ok()?;
+        let mut file = std::fs::File::open(path).ok()?;
+        crate::media::validate_metadata(&mut file).ok()?;
         let size = file.metadata().ok()?.len().min(MAX_PROBE_BYTES);
         Some(Self { file, pos: 0, size })
     }
@@ -136,7 +135,7 @@ pub fn scan_with(root: &Path, excluded: &HashSet<String>, cache: &ProbeCache) ->
     // retain only probes for files still present in this scan.
     let present: HashSet<&str> = tracks.iter().map(|track| track.rel.as_str()).collect();
     crate::lock(&cache.entries).retain(|rel, _| present.contains(rel.as_str()));
-    tracks.sort_by(|a, b| a.rel.to_lowercase().cmp(&b.rel.to_lowercase()));
+    tracks.sort_by_cached_key(|track| track.rel.to_lowercase());
     tracks
 }
 
@@ -365,7 +364,14 @@ fn probe_format(path: &Path) -> Option<ProbeResult> {
     if let Some(extension) = path.extension().and_then(|ext| ext.to_str()) {
         hint.with_extension(extension);
     }
-    symphonia::default::get_probe().format(&hint, stream, &Default::default(), &Default::default()).ok()
+    symphonia::default::get_probe()
+        .format(
+            &hint,
+            stream,
+            &symphonia::core::formats::FormatOptions { enable_gapless: true, ..Default::default() },
+            &Default::default(),
+        )
+        .ok()
 }
 
 /// Embedded artwork of a file (front cover preferred), for the on-disk list
@@ -438,6 +444,9 @@ fn probe(path: &Path) -> Probe {
 }
 
 fn duration_from_params(params: &CodecParameters) -> f64 {
+    if params.codec == symphonia::core::codecs::CODEC_TYPE_OPUS {
+        return crate::opus::duration_from_params(params).map(|duration| duration.as_secs_f64()).unwrap_or(0.0);
+    }
     let Some(frames) = params.n_frames else { return 0.0 };
     if let Some(time_base) = params.time_base {
         let time = time_base.calc_time(frames);
@@ -457,9 +466,13 @@ fn collect_tags(tags: &[Tag], probe: &mut Probe) {
             continue;
         }
         match tag.std_key {
-            Some(StandardTagKey::TrackTitle) if probe.title.is_none() => probe.title = Some(value.to_owned()),
-            Some(StandardTagKey::Artist) if probe.artist.is_none() => probe.artist = Some(value.to_owned()),
-            Some(StandardTagKey::Album) if probe.album.is_none() => probe.album = Some(value.to_owned()),
+            Some(StandardTagKey::TrackTitle) if probe.title.is_none() => {
+                probe.title = Some(crate::api::bounded_text(value))
+            }
+            Some(StandardTagKey::Artist) if probe.artist.is_none() => {
+                probe.artist = Some(crate::api::bounded_text(value))
+            }
+            Some(StandardTagKey::Album) if probe.album.is_none() => probe.album = Some(crate::api::bounded_text(value)),
             _ => {}
         }
     }
@@ -468,6 +481,22 @@ fn collect_tags(tags: &[Tag], probe: &mut Probe) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opus_is_scanned_with_tags_duration_and_embedded_cover() {
+        let root = std::env::temp_dir().join(format!("beat-opus-tags-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("tone.opus");
+        std::fs::write(&path, include_bytes!("../tests/fixtures/tone.opus")).unwrap();
+        let tracks = scan(&root, &HashSet::new());
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].title, "Opus test");
+        assert_eq!(tracks[0].artist, "BEAT test artist");
+        assert_eq!(tracks[0].album, "BEAT test album");
+        assert!((tracks[0].duration - 3.0).abs() < 0.03);
+        assert_eq!(embedded_cover(&path).unwrap(), include_bytes!("../icons/beat-256.png"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

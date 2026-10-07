@@ -64,8 +64,10 @@ pub fn library_path(client: &Client) -> PathBuf {
 pub fn spawn(client: Arc<Client>, cache: Cache, mode: Mode, tx: SyncSender<Event>, cancel: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         let path = state_path(&client);
+        crate::HANDLED_PANIC.with(|handled| handled.set(true));
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan(&client, &cache, mode, &path, &tx, &cancel)));
+        crate::HANDLED_PANIC.with(|handled| handled.set(false));
         let result = outcome.unwrap_or_else(|_| Err("внутренняя ошибка при проверке библиотеки".into()));
         if !cancel.load(Ordering::Relaxed) {
             let _ = tx.send(Event::Finished(result));
@@ -94,11 +96,12 @@ fn scan(
     let mut seen_albums = HashSet::new();
     let mut seen_songs = HashSet::new();
     let mut offset = 0;
+    let mut metadata_bytes = 0u64;
     loop {
         check_cancel(cancel)?;
         // Alphabetical order lets us reach every album, unlike `newest` (only
         // recent albums) or `random` (duplicates and omissions).
-        let page = client.album_list("alphabeticalByName", PAGE_SIZE, offset)?;
+        let page = client.catalog_albums(PAGE_SIZE, offset)?;
         let page_len = page.len();
         if page_len > PAGE_SIZE as usize {
             return Err("сервер прислал больше альбомов, чем запрошено в одной странице".into());
@@ -119,6 +122,19 @@ fn scan(
                 check_cancel(cancel)?;
                 if !seen_songs.insert(song.id.clone()) {
                     continue;
+                }
+                let bytes = song.id.len()
+                    + song.title.len()
+                    + song.artist.len()
+                    + song.album.len()
+                    + song.cover_id.len()
+                    + song.suffix.len()
+                    + 256;
+                metadata_bytes = metadata_bytes.saturating_add(bytes as u64);
+                if metadata_bytes > MAX_STATE_BYTES {
+                    return Err(
+                        "метаданные библиотеки превышают 32 МБ; полный обход прерван, прежний список сохранён".into()
+                    );
                 }
                 if seen_songs.len() > MAX_SONGS {
                     return Err("слишком много песен: полный обход прерван, список не обрезан молча".into());
@@ -222,26 +238,19 @@ pub fn load_library(client: &Client) -> Result<Vec<Song>, String> {
 }
 
 pub fn load_library_from(path: &Path) -> Result<Vec<Song>, String> {
-    let bytes = match read_capped_file(path, MAX_STATE_BYTES, "список песен сервера") {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => return Ok(Vec::new()),
-        Err(err) => {
-            set_aside(path);
-            return Err(err);
-        }
+    let Some(bytes) = read_capped_file(path, MAX_STATE_BYTES, "список песен сервера")? else {
+        return Ok(Vec::new());
     };
     let file: LibraryFile = match serde_json::from_slice(&bytes) {
         Ok(file) => file,
         Err(_) => {
-            set_aside(path);
-            return Err("список песен сервера повреждён; старая копия сохранена рядом".into());
+            return Err(damaged_library(path, "список песен сервера повреждён"));
         }
     };
     if file.version != 1 {
-        set_aside(path);
-        return Err("неподдерживаемый список песен сервера; старая копия сохранена рядом".into());
+        return Err(damaged_library(path, "неподдерживаемый список песен сервера"));
     }
-    Ok(file.songs.into_iter().filter(|song| !song.id.is_empty()).collect())
+    Ok(file.songs.into_iter().filter(|song| crate::api::remote_id(&song.id)).collect())
 }
 
 /// Stores the server song list for the next launch; an oversized list is not
@@ -251,6 +260,10 @@ pub fn save_library(client: &Client, songs: &[Song]) -> Result<(), String> {
 }
 
 pub fn save_library_to(path: &Path, songs: &[Song]) -> Result<(), String> {
+    // A failed backup during load must not be followed by a silent overwrite
+    // when the next scan finishes. Validate the existing file at the write
+    // boundary too; a damaged/unreadable original survives that attempt.
+    load_library_from(path)?;
     #[derive(Serialize)]
     struct Ref<'a> {
         version: u32,
@@ -267,13 +280,16 @@ pub fn save_library_to(path: &Path, songs: &[Song]) -> Result<(), String> {
 }
 
 /// Renames a broken file out of the way; a taken name stays as is.
-fn set_aside(path: &Path) {
+fn damaged_library(path: &Path, problem: &str) -> String {
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let backup = path.with_extension(format!("corrupt-{stamp}.bak"));
     if backup.exists() {
-        return;
+        return format!("{problem}; резервная копия недоступна, прежний файл оставлен на месте");
     }
-    let _ = std::fs::rename(path, &backup);
+    match std::fs::rename(path, &backup) {
+        Ok(()) => format!("{problem}; старая копия сохранена рядом"),
+        Err(error) => format!("{problem}; не удалось сохранить копию: {error}; прежний файл оставлен на месте"),
+    }
 }
 
 fn save_known(path: &Path, known: &HashSet<String>) -> Result<(), String> {

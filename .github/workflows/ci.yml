@@ -31,6 +31,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check local documentation links
         run: python -B scripts/check_docs.py
+      - name: Test signed package verification and tamper rejection
+        run: python -B -m unittest discover -s scripts -p 'test_*.py' -q
       - name: Check built-in translations and format placeholders
         run: python -B scripts/update_i18n.py --check
 
@@ -76,5 +78,6 @@ jobs:
             dist/BUILD.json
             dist/SHA256SUMS.txt
             dist/COMPONENT-NOTICES.txt
+            dist/LICENSE
           if-no-files-found: error
           retention-days: 7

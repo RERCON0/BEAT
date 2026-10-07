@@ -91,7 +91,9 @@ fn unprotect_secret(stored: &str) -> Result<String, String> {
     }
     let bytes = hex
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let pair = std::str::from_utf8(pair).map_err(|_| crate::i18n::tr("повреждённый пароль").to_string())?;
             u8::from_str_radix(pair, 16).map_err(|_| crate::i18n::tr("повреждённый пароль").to_string())

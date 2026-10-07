@@ -8,6 +8,7 @@
 <a href="https://github.com/RERCON0/BEAT/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/RERCON0/BEAT/actions/workflows/ci.yml/badge.svg?branch=main"></a>
 <a href="https://github.com/RERCON0/BEAT/actions/workflows/security.yml"><img alt="Security" src="https://github.com/RERCON0/BEAT/actions/workflows/security.yml/badge.svg?branch=main"></a>
 <a href="#build"><img alt="Windows x64" src="https://img.shields.io/badge/Windows-x64-0078D4?logo=windows&logoColor=white"></a>
+<a href="LICENSE"><img alt="License: GPL v3 or later" src="https://img.shields.io/github/license/RERCON0/BEAT"></a>
 <a href="https://t.me/rercon"><img alt="Telegram" src="https://img.shields.io/badge/Telegram-@rercon-26A5E4?logo=telegram&logoColor=white"></a>
 </p>
 
@@ -54,6 +55,9 @@ buffering; seeking during download is limited to the data already received.
 > Gapless playback needs the next file to be ready in time. A slow server or
 > an unfinished download can still require buffering. Silence already present
 > in the recording is preserved.
+
+Starting with 0.2.1, the portable ZIP [on Releases](https://github.com/RERCON0/BEAT/releases/latest)
+is signed with Ed25519; see [verification and the publisher key](docs/RELEASING.md).
 
 ## Quick start
 
@@ -136,6 +140,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 python -B scripts/check_docs.py
 python -B scripts/update_i18n.py --check
+python -B -m unittest discover -s scripts -p 'test_*.py' -q
 ```
 
 CI checks code, translations, documentation and the optimized Windows build.
@@ -145,8 +150,15 @@ include the unsigned EXE, SHA-256, source revision and component notices.
 
 - [Reference (RU)](docs/REFERENCE.md) — queue, streaming, caching and project structure.
 - [Security (RU)](SECURITY.md) — protection boundaries and dependency warnings.
+- [0.2.1 maintenance review (RU)](docs/AUDIT-2026-10-08.md) — module split, dependencies and signed packages.
 - [Audit before publication (RU)](docs/AUDIT-2026-10-07.md) — fixes and verification.
 - [Icon](icons/README.md) · [Cascadia Mono notice](fonts/OFL-notice.txt) and [license](fonts/OFL.txt).
 - [Bundled audio and Windows components](third_party/README.md) — sources and licenses.
+
+## License
+
+[GNU GPL v3 or later](LICENSE), like SNATCH. Bundled components keep their
+own licenses; their notices are included in the package. [Release signing](docs/RELEASING.md)
+· [Dependency maintenance](docs/DEPENDENCIES.md).
 
 rercon prod. · [Telegram](https://t.me/rercon)

@@ -8,6 +8,7 @@
 <a href="https://github.com/RERCON0/BEAT/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/RERCON0/BEAT/actions/workflows/ci.yml/badge.svg?branch=main"></a>
 <a href="https://github.com/RERCON0/BEAT/actions/workflows/security.yml"><img alt="Security" src="https://github.com/RERCON0/BEAT/actions/workflows/security.yml/badge.svg?branch=main"></a>
 <a href="#сборка"><img alt="Windows x64" src="https://img.shields.io/badge/Windows-x64-0078D4?logo=windows&logoColor=white"></a>
+<a href="LICENSE"><img alt="License: GPL v3 or later" src="https://img.shields.io/github/license/RERCON0/BEAT"></a>
 <a href="https://t.me/rercon"><img alt="Telegram" src="https://img.shields.io/badge/Telegram-@rercon-26A5E4?logo=telegram&logoColor=white"></a>
 </p>
 
@@ -55,6 +56,9 @@ BEAT — лёгкое нативное Windows-приложение на Rust. �
 > Для перехода без паузы следующий файл должен быть готов вовремя. Медленный
 > сервер или незавершённая загрузка могут потребовать буферизации. Тишина,
 > которая уже есть в самой записи, сохраняется.
+
+С версии 0.2.1 портативный ZIP [в релизах](https://github.com/RERCON0/BEAT/releases/latest)
+подписан Ed25519; [проверка подписи и ключ издателя](docs/RELEASING.md).
 
 ## Быстрый старт
 
@@ -137,6 +141,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 python -B scripts/check_docs.py
 python -B scripts/update_i18n.py --check
+python -B -m unittest discover -s scripts -p 'test_*.py' -q
 ```
 
 CI проверяет код, переводы, документацию и оптимизированную Windows-сборку.
@@ -146,8 +151,15 @@ Actions закреплены полными SHA; Dependabot предлагает
 
 - [Справочник](docs/REFERENCE.md) — очередь, потоки, кеширование и структура проекта.
 - [Безопасность](SECURITY.md) — границы защиты и предупреждения зависимостей.
+- [Проверка 0.2.1](docs/AUDIT-2026-10-08.md) — модули, зависимости и подписанные пакеты.
 - [Аудит перед публикацией](docs/AUDIT-2026-10-07.md) — исправления и проверки.
 - [Иконка](icons/README.md) · [Уведомление Cascadia Mono](fonts/OFL-notice.txt) и [лицензия](fonts/OFL.txt).
 - [Встроенные аудио- и Windows-компоненты](third_party/README.md) — исходники и лицензии.
+
+## Лицензия
+
+[GNU GPL v3 или новее](LICENSE), как в SNATCH. У встроенных компонентов свои
+лицензии; уведомления включены в пакет. [Сборка и подпись релизов](docs/RELEASING.md)
+· [Обновление зависимостей](docs/DEPENDENCIES.md).
 
 rercon prod. · [Telegram](https://t.me/rercon)

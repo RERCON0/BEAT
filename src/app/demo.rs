@@ -1,5 +1,6 @@
 //! Application-owned README capture: synthetic metadata, no profile or audio.
-use crate::{egui, i18n::Language, Config, DiskEntry, LocalTrack, View};
+use super::{egui, Config, DiskEntry, LocalTrack, View};
+use crate::i18n::Language;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -37,6 +38,10 @@ impl Snapshot {
         Ok(Some(Self { output, language, dark, frames: 0, started: Instant::now() }))
     }
 
+    #[cfg(test)]
+    pub(super) fn for_test() -> Self {
+        Self { output: PathBuf::new(), language: Language::Ru, dark: true, frames: 0, started: Instant::now() }
+    }
     pub fn config(&self) -> Config {
         Config {
             language: self.language,
@@ -81,7 +86,7 @@ impl Snapshot {
         }
         self.frames += 1;
         if self.frames == 5 {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
         }
         ctx.request_repaint_after(Duration::from_millis(100));
         false
@@ -124,7 +129,7 @@ pub fn populate(app: &mut crate::BeatApp, ctx: &egui::Context) {
         // Original geometric thumbnails, not artists' album artwork.
         let colors = [[25, 77, 68], [69, 47, 90], [42, 66, 98], [96, 54, 44]];
         let rgb = colors[index % colors.len()];
-        let mut cover = egui::ColorImage::new([96, 96], egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+        let mut cover = egui::ColorImage::filled([96, 96], egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
         for y in 0..96i32 {
             for x in 0..96i32 {
                 let radius = (x - 48).pow(2) + (y - 48).pow(2);
@@ -138,7 +143,7 @@ pub fn populate(app: &mut crate::BeatApp, ctx: &egui::Context) {
             }
         }
         let texture = ctx.load_texture(format!("demo-cover-{index}"), cover, egui::TextureOptions::LINEAR);
-        for px in [crate::ROW_COVER_PX, crate::COVER_PX] {
+        for px in [super::ROW_COVER_PX, super::COVER_PX] {
             app.covers.insert(format!("{}#{px}#{}", entry.cover_key(), app.disk_cover_generation), texture.clone());
         }
         entries.push(entry);
@@ -163,11 +168,12 @@ mod tests {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 300.0))),
                 ..Default::default()
             };
-            let _ = ctx.run(input(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            let mut output = ctx.run_ui(input(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     center = ui.button("Save settings").rect.center();
                 });
             });
+            output.textures_delta.clear();
             let mut raw = input();
             raw.events = vec![
                 egui::Event::PointerMoved(center),
@@ -185,8 +191,9 @@ mod tests {
                 },
             ];
             let mut clicked = false;
-            let _ = ctx.run(raw, |ctx| {
+            let mut output = ctx.run_ui(raw, |ui| {
                 if capture {
+                    let ctx = ui.ctx().clone();
                     Snapshot {
                         output: PathBuf::new(),
                         language: Language::En,
@@ -194,12 +201,13 @@ mod tests {
                         frames: 0,
                         started: Instant::now(),
                     }
-                    .tick(ctx);
+                    .tick(&ctx);
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     clicked = ui.button("Save settings").clicked();
                 });
             });
+            output.textures_delta.clear();
             clicked
         }
         assert!(inject_click(false), "the control click did not reach the widget");

@@ -153,7 +153,7 @@ fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let body = egui::FontData::from_static(BUNDLED_MONO)
         .tweak(egui::FontTweak { y_offset_factor: 0.15, ..Default::default() });
-    fonts.font_data.insert("mono-system".to_owned(), body);
+    fonts.font_data.insert("mono-system".to_owned(), body.into());
     for family in [egui::FontFamily::Monospace, egui::FontFamily::Proportional] {
         if let Some(list) = fonts.families.get_mut(&family) {
             list.insert(0, "mono-system".to_owned());
@@ -172,20 +172,30 @@ fn setup_fonts(ctx: &egui::Context) {
     };
     fonts.font_data.insert(
         "mono-button".to_owned(),
-        egui::FontData::from_static(BUNDLED_MONO).tweak(egui::FontTweak { y_offset_factor: 0.0, ..Default::default() }),
+        egui::FontData::from_static(BUNDLED_MONO)
+            .tweak(egui::FontTweak { y_offset_factor: 0.0, ..Default::default() })
+            .into(),
     );
     fonts.families.insert(egui::FontFamily::Name("button".into()), family("mono-button"));
     fonts.font_data.insert(
         "mono-title".to_owned(),
         egui::FontData::from_static(BUNDLED_MONO)
-            .tweak(egui::FontTweak { y_offset_factor: -0.08, ..Default::default() }),
+            .tweak(egui::FontTweak { y_offset_factor: -0.08, ..Default::default() })
+            .into(),
     );
     fonts.families.insert(egui::FontFamily::Name("title".into()), family("mono-title"));
     fonts.font_data.insert(
         "mono-field".to_owned(),
-        egui::FontData::from_static(BUNDLED_MONO).tweak(egui::FontTweak { y_offset_factor: 0.0, ..Default::default() }),
+        egui::FontData::from_static(BUNDLED_MONO)
+            .tweak(egui::FontTweak { y_offset_factor: 0.0, ..Default::default() })
+            .into(),
     );
     fonts.families.insert(egui::FontFamily::Name("field".into()), family("mono-field"));
+    // Use the symbol face directly: recent egui shaping can clip fallback
+    // arrows when the primary face uses different metrics.
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("symbols".into()), fallbacks.iter().map(|name| (*name).into()).collect());
     ctx.set_fonts(fonts);
 }
 
@@ -200,7 +210,7 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(10.0, 8.0);
         style.spacing.interact_size.y = 28.0;
-        style.spacing.window_margin = egui::Margin::symmetric(10.0, 15.0);
+        style.spacing.window_margin = egui::Margin::symmetric(10, 15);
         style.spacing.scroll = egui::style::ScrollStyle { foreground_color: true, ..egui::style::ScrollStyle::solid() };
         let mut ts = style.text_styles.clone();
         ts.insert(egui::TextStyle::Body, egui::FontId::new(13.0, egui::FontFamily::Proportional));
@@ -250,8 +260,8 @@ fn terminal_visuals(dark: bool) -> egui::Visuals {
     };
 
     let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
-    v.window_rounding = egui::Rounding::ZERO;
-    v.menu_rounding = egui::Rounding::ZERO;
+    v.window_corner_radius = egui::CornerRadius::ZERO;
+    v.menu_corner_radius = egui::CornerRadius::ZERO;
     v.window_fill = lift;
     v.window_stroke = egui::Stroke::new(1.0, line);
     v.window_shadow = egui::Shadow::NONE;
@@ -273,7 +283,7 @@ fn terminal_visuals(dark: bool) -> egui::Visuals {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        w.rounding = egui::Rounding::ZERO;
+        w.corner_radius = egui::CornerRadius::ZERO;
         w.bg_fill = field;
     }
     v.widgets.noninteractive.weak_bg_fill = bg;
@@ -328,7 +338,7 @@ pub fn field_font() -> egui::FontSelection {
 /// Part of the shared palette; BEAT does not draw it yet.
 #[allow(dead_code)]
 pub fn tag(ui: &mut egui::Ui, prefix: &str, value: &str, value_color: Color32) {
-    egui::Frame::none().stroke(egui::Stroke::new(1.0, line())).inner_margin(egui::Margin::symmetric(7.0, 4.0)).show(
+    egui::Frame::NONE.stroke(egui::Stroke::new(1.0, line())).inner_margin(egui::Margin::symmetric(7, 4)).show(
         ui,
         |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;

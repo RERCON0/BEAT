@@ -128,8 +128,7 @@ pub fn path_key(path: &Path) -> String {
 }
 
 fn root_key(root: &Path) -> String {
-    use md5::{Digest, Md5};
-    format!("{:x}", Md5::digest(path_key(root)))
+    crate::api::md5_hex(&path_key(root))
 }
 
 /// Removing a configured root also removes its entries from the queue.

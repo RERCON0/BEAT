@@ -1,8 +1,9 @@
 [package]
 name = "beat"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
-rust-version = "1.92"
+rust-version = "1.99"
+license = "GPL-3.0-or-later"
 description = "A lightweight Windows music player for Navidrome and local files"
 
 [[bin]]
@@ -10,15 +11,15 @@ name = "beat"
 path = "src/main.rs"
 
 [dependencies]
-eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow"] }
 # eframe already pulls this in transitively to decode its own icons/textures -
 # declaring it directly just lets our own code decode covers and the app icon.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-md-5 = "0.10"
+md-5 = "0.11"
 # default-features off: drops the HTTP/2 stack (h2); every endpoint we call is
-# UTF-8 JSON. default-tls uses schannel on Windows; system-proxy keeps
+# UTF-8 JSON. native-tls-no-alpn keeps Schannel on Windows without HTTP/2; system-proxy keeps
 # corporate-proxy support.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "default-tls", "system-proxy"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls-no-alpn", "system-proxy", "query"] }
 # Playback: rodio + symphonia decode mp3/flac/ogg/wav/m4a; the "play from the
 # growing cache file" reader lives in player.rs. default-features off drops the
 # recording stack; playback is required for the output device.
@@ -26,7 +27,9 @@ rodio = { version = "0.22", default-features = false, features = ["playback", "m
 # Tag/duration probe for local files (title, artist, album). Only reading is
 # done here; playback stays in rodio. Format features mirror rodio's above.
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "ogg", "vorbis", "wav", "isomp4", "mkv"] }
-# The maintained libopus adapter matching Symphonia 0.5; statically bundled.
+# Rodio 0.22 and the libopus adapter must share Symphonia 0.5.
+# Upgrade this family together and retain the core allocation guard.
+# See docs/DEPENDENCIES.md for the 0.6 migration gate.
 symphonia-adapter-libopus = "0.2.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

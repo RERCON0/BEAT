@@ -92,10 +92,12 @@ pub fn load_in(dir: &Path, key: &str) -> Option<ColorImage> {
         }
         let pixels = decoded
             .as_raw()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| egui::Color32::from_rgba_premultiplied(p[0], p[1], p[2], p[3]))
             .collect();
-        Some(ColorImage { size: [width as usize, height as usize], pixels })
+        Some(ColorImage::new([width as usize, height as usize], pixels))
     })
 }
 

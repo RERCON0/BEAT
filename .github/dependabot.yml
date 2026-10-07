@@ -5,9 +5,22 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # Symphonia 0.6 requires a coordinated Rodio/Opus migration; see docs/DEPENDENCIES.md.
+    ignore:
+      - dependency-name: symphonia
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: symphonia-adapter-libopus
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     groups:
+      audio:
+        patterns: ["rodio", "symphonia*", "opusic-sys", "cpal"]
+      interface:
+        patterns: ["eframe", "egui*", "epaint*", "emath", "ecolor", "image"]
+      network:
+        patterns: ["reqwest", "hyper*", "native-tls", "schannel", "tokio*"]
       cargo:
         patterns: ["*"]
+        exclude-patterns: ["rodio", "symphonia*", "opusic-sys", "cpal", "eframe", "egui*", "epaint*", "emath", "ecolor", "image", "reqwest", "hyper*", "native-tls", "schannel", "tokio*"]
   - package-ecosystem: github-actions
     directory: /
     schedule:

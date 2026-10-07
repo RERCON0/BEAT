@@ -73,6 +73,57 @@ def pe_info(data: bytes, subsystem: int) -> dict:
 
 
 
+def component_notices() -> str:
+    """Collect notices from the exact Windows build graph, including bundled fonts."""
+    metadata = json.loads(subprocess.check_output(
+        ["cargo", "metadata", "--locked", "--offline", "--format-version", "1",
+         "--filter-platform", "x86_64-pc-windows-msvc"], cwd=ROOT, timeout=120))
+    packages = {item["id"]: item for item in metadata["packages"]}
+    nodes = {item["id"]: item for item in metadata["resolve"]["nodes"]}
+    pending, reachable = [metadata["resolve"]["root"]], set()
+    while pending:
+        identity = pending.pop()
+        if identity not in reachable:
+            reachable.add(identity)
+            pending.extend(item["pkg"] for item in nodes[identity]["deps"])
+    notices = []
+    extra = [ROOT / "fonts/OFL-notice.txt", ROOT / "fonts/OFL.txt",
+             *sorted((ROOT / "third_party").glob("*-LICENSE.txt"))]
+    notices.extend(f"{file.relative_to(ROOT)}\n\n{file.read_text(encoding='utf-8')}" for file in extra)
+    generic = {"MPL-2.0": ROOT / "vendor/symphonia-core/LICENSE",
+               "Apache-2.0": ROOT / "third_party/licenses/APACHE-2.0.txt",
+               "MIT OR Apache-2.0": ROOT / "third_party/licenses/APACHE-2.0.txt",
+               "(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0": ROOT / "third_party/licenses/APACHE-2.0.txt",
+               "BSL-1.0": ROOT / "third_party/licenses/BSL-1.0.txt"}
+    root = metadata["resolve"]["root"]
+    for identity in sorted(reachable, key=lambda item: (packages[item]["name"], packages[item]["version"])):
+        if identity == root:
+            continue
+        package = packages[identity]
+        folder = Path(package["manifest_path"]).parent
+        files = sorted(file for file in folder.rglob("*") if file.is_file()
+                       and file.name.lower().startswith(("license", "licence", "copying", "copyright", "notice")))
+        if package["name"] == "epaint_default_fonts":
+            files.extend(sorted((folder / "fonts").glob("*.txt")))
+        license_id = package.get("license")
+        header = f"{package['name']} {package['version']} / {license_id}\n{package.get('repository') or ''}"
+        body = []
+        for file in sorted(set(files)):
+            if not 0 < file.stat().st_size <= MAX_META:
+                raise ValueError(f"Invalid notice size: {package['name']} / {file.name}")
+            body.append(f"{file.relative_to(folder)}\n\n{file.read_text(encoding='utf-8')}")
+        # Workspace crates sometimes omit their root license files from the
+        # registry archive. Select Apache for dual licensing; retain package
+        # provenance, authors and the complete applicable generic text.
+        if not files or package["name"] == "epaint_default_fonts":
+            fallback = generic.get(license_id)
+            if fallback is None:
+                raise ValueError(f"Missing license notice: {package['name']} / {license_id}")
+            body.append(f"Authors: {', '.join(package['authors'])}\n\n{fallback.read_text(encoding='utf-8')}")
+        notices.append(header + "\n\n" + "\n\n".join(body))
+    return "\n\n".join(notices)
+
+
 def check(path):
     data = path.read_bytes()
     pe = pe_info(data, 2)
@@ -86,13 +137,8 @@ def check(path):
     }
     (path.parent / "BUILD.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     (path.parent / "SHA256SUMS.txt").write_text(f"{digest}  {path.name}\n", encoding="ascii")
-    notices = [ROOT / "fonts/OFL-notice.txt", ROOT / "fonts/OFL.txt",
-               *sorted((ROOT / "third_party").glob("*-LICENSE.txt")),
-               ROOT / "vendor/symphonia-core/LICENSE"]
-    (path.parent / "COMPONENT-NOTICES.txt").write_text(
-        "\n\n".join(f"{file.relative_to(ROOT)}\n\n{file.read_text(encoding='utf-8')}" for file in notices),
-        encoding="utf-8",
-    )
+    (path.parent / "COMPONENT-NOTICES.txt").write_text(component_notices(), encoding="utf-8")
+    (path.parent / "LICENSE").write_bytes((ROOT / "LICENSE").read_bytes())
     print(f"Verified unsigned {package['name']} Windows x64 GUI / {commit}")
 
 

@@ -1,3 +1,8 @@
 # Keep the portable Windows executable independent of VC++ Redistributable.
 [target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# libopus defaults to the DLL runtime even when Rust uses +crt-static.
+# This target-specific CMake initialization keeps both on /MT.
+[env]
+CMAKE_TOOLCHAIN_FILE_x86_64_pc_windows_msvc = { value = ".cargo/opus-msvc.cmake", relative = true }

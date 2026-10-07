@@ -364,7 +364,7 @@ fn random_salt() -> String {
     salt
 }
 
-fn md5_hex(input: &str) -> String {
+pub(crate) fn md5_hex(input: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(input.as_bytes());
     let digest = hasher.finalize();

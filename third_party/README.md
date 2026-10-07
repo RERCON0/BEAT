@@ -17,3 +17,12 @@ Opus воспроизводится через `symphonia-adapter-libopus 0.2.9`
 
 В CI уведомления этих компонентов и встроенного шрифта помещаются рядом
 с EXE в `COMPONENT-NOTICES.txt`. Сохраняйте этот файл при распространении сборки.
+
+The release notice collector reads the locked Windows dependency graph with
+`cargo metadata`, includes each crate's packaged license/notice files and the
+built-in egui font notices (Hack, Noto Emoji, Ubuntu and emoji-icon-font).
+Workspace crates whose registry archives omit license files use the complete
+applicable generic text with package provenance and authors; Apache is selected
+for `MIT OR Apache-2.0`. The retained [Apache](licenses/APACHE-2.0.txt) and
+[Boost](licenses/BSL-1.0.txt) texts come from the locked reqwest 0.13.5 and
+error-code 3.4.0 packages. Unknown missing notices fail packaging.

@@ -2,7 +2,7 @@
 
 <h1 align="center">BEAT</h1>
 
-<p align="center"><strong>A lightweight Windows player for Navidrome and your own music.<br>One library. Fast playback. Your music stays available offline.</strong></p>
+<p align="center"><strong>A lightweight Windows player for Navidrome and your own music.<br>Streams and automatically caches music from Navidrome for offline listening.</strong></p>
 
 <p align="center">
 <a href="https://github.com/RERCON0/BEAT/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/RERCON0/BEAT/actions/workflows/ci.yml/badge.svg?branch=main"></a>
@@ -35,6 +35,7 @@ Downloaded tracks remain ordinary files; local playback works without a server.
 | | What BEAT does |
 |---|---|
 | **Lightweight** | Native Rust application with bundled fonts and codecs; runs as a single portable EXE |
+| **Automatic Navidrome caching** | Tracks are saved in the background as they play; finished downloads remain available offline. Enable automatic caching of new server songs to save future additions too |
 | **One library** | Server songs, cached downloads and up to 16 local folders in one list; instant title, artist and album filter |
 | **Browse and search** | Artists, albums, embedded artwork and search across the server and local music |
 | **Playback queue** | Open from the status bar; play a selected track, reorder or remove entries, or keep only the current track |

@@ -1,9 +1,9 @@
 [package]
 name = "beat"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.92"
-description = "BEAT — Navidrome cache player (GUI) by rercon prod."
+description = "A lightweight Windows music player for Navidrome and local files"
 
 [[bin]]
 name = "beat"

@@ -13,17 +13,13 @@
 
 <p align="center">
 <a href="README.md">English</a> · <a href="README.ru.md">Русский</a><br>
-<a href="#features">Features</a> · <a href="#quick-start">Quick start</a> · <a href="#build">Build</a> ·
+<a href="https://github.com/RERCON0/BEAT/releases/latest">Download</a> · <a href="#features">Features</a> · <a href="#quick-start">Quick start</a> · <a href="#build">Build</a> ·
 <a href="#settings-and-data">Data</a> · <a href="docs/REFERENCE.md">Reference (RU)</a>
 </p>
 
-BEAT is written in Rust and runs in a native window without Electron.
+BEAT is a lightweight native Windows application written in Rust.
 Connect [Navidrome](https://www.navidrome.org/) or add your music folders.
 Downloaded tracks remain ordinary files; local playback works without a server.
-
-> [!NOTE]
-> BEAT is in development. Build from source or use a test artifact from a
-> successful Windows CI run. Public releases will come later.
 
 <img src="docs/screenshots/beat-dark.png" width="1280" alt="BEAT dark theme with a demonstration music library">
 
@@ -38,7 +34,7 @@ Downloaded tracks remain ordinary files; local playback works without a server.
 
 | | What BEAT does |
 |---|---|
-| **Lightweight** | Native Rust application, bundled fonts and codecs, no browser runtime or separate codec installation |
+| **Lightweight** | Native Rust application with bundled fonts and codecs; runs as a single portable EXE |
 | **One library** | Server songs, cached downloads and up to 16 local folders in one list; instant title, artist and album filter |
 | **Browse and search** | Artists, albums, embedded artwork and search across the server and local music |
 | **Playback queue** | Open from the status bar; play a selected track, reorder or remove entries, or keep only the current track |

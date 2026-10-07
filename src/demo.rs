@@ -54,6 +54,9 @@ impl Snapshot {
             });
             // A capture run has no interactive actions, even if clicked.
             input.events.clear();
+            input.pointer = Default::default();
+            input.keys_down.clear();
+            input.modifiers = Default::default();
             capture
         });
         if let Some(image) = image {
@@ -146,4 +149,60 @@ pub fn populate(app: &mut crate::BeatApp, ctx: &egui::Context) {
     app.local_stats = (entries.len(), 0);
     app.set_disk_entries(entries);
     app.view = View::Library;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn capture_input_cannot_activate_an_application_button() {
+        fn inject_click(capture: bool) -> bool {
+            let ctx = egui::Context::default();
+            let mut center = egui::Pos2::ZERO;
+            let input = || egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 300.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    center = ui.button("Save settings").rect.center();
+                });
+            });
+            let mut raw = input();
+            raw.events = vec![
+                egui::Event::PointerMoved(center),
+                egui::Event::PointerButton {
+                    pos: center,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: center,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ];
+            let mut clicked = false;
+            let _ = ctx.run(raw, |ctx| {
+                if capture {
+                    Snapshot {
+                        output: PathBuf::new(),
+                        language: Language::En,
+                        dark: true,
+                        frames: 0,
+                        started: Instant::now(),
+                    }
+                    .tick(ctx);
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    clicked = ui.button("Save settings").clicked();
+                });
+            });
+            clicked
+        }
+        assert!(inject_click(false), "the control click did not reach the widget");
+        assert!(!inject_click(true), "a screenshot run accepted an interactive action");
+    }
 }

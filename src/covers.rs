@@ -56,12 +56,12 @@ pub fn file_key(rel: &str, path: &Path, px: u32) -> Option<String> {
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    Some(format!("file:{rel}:{}:{mtime}:{px}", meta.len()))
+    Some(format!("square-v1:file:{rel}:{}:{mtime}:{px}", meta.len()))
 }
 
 /// Cache key for a server cover id at a given thumbnail size.
 pub fn server_key(cover_id: &str, px: u32) -> String {
-    format!("cover:{cover_id}:{px}")
+    format!("square-v1:cover:{cover_id}:{px}")
 }
 
 /// Decoded thumbnail from the cache, if this exact key was stored before.
@@ -208,6 +208,8 @@ mod tests {
         let path = dir.join("a.mp3");
         std::fs::write(&path, b"one").unwrap();
         let first = file_key("a.mp3", &path, 96).unwrap();
+        assert!(first.starts_with("square-v1:file:"), "old rectangular thumbnails must be regenerated");
+        assert_eq!(server_key("album-1", 96), "square-v1:cover:album-1:96");
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&path, b"a longer payload").unwrap();
         let second = file_key("a.mp3", &path, 96).unwrap();

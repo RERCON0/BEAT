@@ -3371,12 +3371,7 @@ fn album_card(
                 let (rect, response) = ui.allocate_exact_size(egui::vec2(168.0, 168.0), egui::Sense::click());
                 match cover {
                     Some(texture) => {
-                        ui.painter().image(
-                            texture.id(),
-                            rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
-                        );
+                        ui.painter().image(texture.id(), rect, square_cover_uv(texture.size()), egui::Color32::WHITE);
                     }
                     None => {
                         ui.painter().rect_filled(rect, 0.0, theme::field());
@@ -3497,12 +3492,7 @@ fn row_cover(ui: &mut egui::Ui, size: f32, texture: Option<egui::TextureHandle>,
     let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), sense);
     match texture {
         Some(texture) => {
-            ui.painter().image(
-                texture.id(),
-                rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
+            ui.painter().image(texture.id(), rect, square_cover_uv(texture.size()), egui::Color32::WHITE);
         }
         None => {
             ui.painter().rect_filled(rect, 0.0, theme::field());
@@ -3516,6 +3506,22 @@ fn row_cover(ui: &mut egui::Ui, size: f32, texture: Option<egui::TextureHandle>,
         }
     }
     response
+}
+
+/// Fill the square cover slot without stretching rectangular textures. New
+/// thumbnails are square; this also handles an older/manually replaced cache.
+fn square_cover_uv([width, height]: [usize; 2]) -> egui::Rect {
+    let full = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+    if width == 0 || height == 0 {
+        return full;
+    }
+    if width > height {
+        let margin = (1.0 - height as f32 / width as f32) * 0.5;
+        egui::Rect::from_min_max(egui::pos2(margin, 0.0), egui::pos2(1.0 - margin, 1.0))
+    } else {
+        let margin = (1.0 - width as f32 / height as f32) * 0.5;
+        egui::Rect::from_min_max(egui::pos2(0.0, margin), egui::pos2(1.0, 1.0 - margin))
+    }
 }
 
 /// Vector "local file" mark: a small folder glyph drawn with the painter
@@ -4091,7 +4097,15 @@ fn decode_cover_sized(bytes: &[u8], size: u32) -> Option<egui::ColorImage> {
         let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
         reader.limits(cover_limits());
         let image = reader.decode().ok()?;
-        let thumb = image.thumbnail(size, size).to_rgba8();
+        // Crop a borrowed view BEFORE resizing. Resizing a very wide image to
+        // fill a square first could allocate a huge intermediate bitmap.
+        let (width, height) = (image.width(), image.height());
+        let side = width.min(height);
+        if side == 0 || size == 0 {
+            return None;
+        }
+        let cropped = image::imageops::crop_imm(&image, (width - side) / 2, (height - side) / 2, side, side);
+        let thumb = image::imageops::thumbnail(&*cropped, size, size);
         Some(egui::ColorImage::from_rgba_unmultiplied(
             [thumb.width() as usize, thumb.height() as usize],
             thumb.as_raw(),
@@ -4332,6 +4346,43 @@ mod tests {
         assert!(decode_cover_sized(&png(64, 64), 32).is_some(), "an ordinary cover must decode");
         assert!(decode_cover_sized(&png(9_000, 8), 32).is_none(), "9000 px wide accepted");
         assert!(decode_cover_sized(&png(8, 9_000), 32).is_none(), "9000 px tall accepted");
+    }
+
+    #[test]
+    fn rectangular_artwork_is_cropped_before_making_a_square_thumbnail() {
+        for (width, height) in [(128, 72), (72, 128), (72, 72), (8192, 1)] {
+            let side = width.min(height);
+            let left = (width - side) / 2;
+            let top = (height - side) / 2;
+            let pixels = image::RgbaImage::from_fn(width, height, |x, y| {
+                if x >= left && x < left + side && y >= top && y < top + side {
+                    image::Rgba([40, 100, 160, 255])
+                } else {
+                    image::Rgba([0, 0, 0, 255])
+                }
+            });
+            let mut bytes = Vec::new();
+            pixels.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
+            let cover = decode_cover_sized(&bytes, 32).unwrap();
+            assert_eq!(cover.size, [32, 32], "{width} x {height}");
+            assert!(
+                cover.pixels.iter().all(|p| *p == egui::Color32::from_rgb(40, 100, 160)),
+                "the outer bars must be cropped, not squeezed"
+            );
+            assert!(decode_cover_sized(&bytes, 0).is_none());
+        }
+    }
+
+    #[test]
+    fn square_cover_uv_keeps_cached_rectangles_in_proportion() {
+        for size in [[48, 27], [27, 48], [48, 48]] {
+            let uv = square_cover_uv(size);
+            let width = uv.width() * size[0] as f32;
+            let height = uv.height() * size[1] as f32;
+            assert!((width - height).abs() < 0.001);
+            assert!((uv.center().x - 0.5).abs() < 0.001);
+            assert!((uv.center().y - 0.5).abs() < 0.001);
+        }
     }
 
     #[test]

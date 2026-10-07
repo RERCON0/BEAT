@@ -38,6 +38,19 @@ struct Inner {
 }
 
 impl Stats {
+    pub fn preview() -> Self {
+        Self {
+            path: PathBuf::new(),
+            scope: String::new(),
+            inner: Mutex::new(Inner {
+                counts: HashMap::new(),
+                dirty: false,
+                saved_at: Instant::now(),
+                save_blocked: true,
+                warning: None,
+            }),
+        }
+    }
     pub fn load() -> Self {
         Self::load_from(default_path())
     }
@@ -84,9 +97,10 @@ impl Stats {
                     HashMap::new(),
                     !saved,
                     Some(if saved {
-                        "история прослушиваний повреждена; прежний файл сохранён рядом".into()
+                        crate::i18n::tr("история прослушиваний повреждена; прежний файл сохранён рядом").into()
                     } else {
-                        "историю прослушиваний не удалось прочитать; её сохранение заблокировано".into()
+                        crate::i18n::tr("историю прослушиваний не удалось прочитать; её сохранение заблокировано")
+                            .into()
                     }),
                 )
             }
@@ -173,7 +187,7 @@ fn read_counts(path: &Path) -> Result<HashMap<String, u64>, ()> {
 
 fn save(path: &Path, inner: &mut Inner) -> Result<(), String> {
     if inner.save_blocked {
-        return Err("история прослушиваний не прочитана; прежний файл не будет перезаписан".into());
+        return Err(crate::i18n::tr("история прослушиваний не прочитана; прежний файл не будет перезаписан").into());
     }
     // Bound the file: the least played entries fall off first.
     if inner.counts.len() > MAX_ENTRIES {
@@ -185,7 +199,7 @@ fn save(path: &Path, inner: &mut Inner) -> Result<(), String> {
     let bytes =
         serde_json::to_vec(&StatsFile { version: 1, counts: inner.counts.clone() }).map_err(|e| e.to_string())?;
     if bytes.len() as u64 > MAX_BYTES {
-        return Err("история прослушиваний слишком большая; прежний файл не заменён".into());
+        return Err(crate::i18n::tr("история прослушиваний слишком большая; прежний файл не заменён").into());
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;

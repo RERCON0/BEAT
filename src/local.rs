@@ -115,6 +115,79 @@ pub fn is_local_id(id: &str) -> bool {
     id.starts_with(LOCAL_ID_PREFIX)
 }
 
+pub fn path_key(path: &Path) -> String {
+    let key = path.components().collect::<PathBuf>().to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        key.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        key
+    }
+}
+
+fn root_key(root: &Path) -> String {
+    use md5::{Digest, Md5};
+    format!("{:x}", Md5::digest(path_key(root)))
+}
+
+/// Removing a configured root also removes its entries from the queue.
+/// Server ids and legacy cache-relative local ids belong to other sources.
+pub fn in_roots(id: &str, roots: &[PathBuf]) -> bool {
+    let Some(scoped) = id.strip_prefix("local:@") else {
+        return true;
+    };
+    let Some((key, _)) = scoped.split_once(':') else {
+        return false;
+    };
+    roots.iter().any(|root| root_key(root) == key)
+}
+
+/// Resolve only inside the configured root, never an absolute path from an id.
+/// Old cache-relative ids remain valid for existing sessions and play counts.
+pub fn resolve(id: &str, cache_root: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
+    let rel = id.strip_prefix(LOCAL_ID_PREFIX)?;
+    let (root, rel) = if let Some(scoped) = rel.strip_prefix('@') {
+        let (key, rel) = scoped.split_once(':')?;
+        (roots.iter().find(|root| root_key(root) == key)?.as_path(), rel)
+    } else {
+        (cache_root, rel)
+    };
+    crate::cache::safe_path(root, rel).filter(|path| path.is_file())
+}
+
+/// One shared bounded scan, de-duplicated by full path for overlapping roots.
+pub fn scan_roots(
+    cache_root: &Path,
+    roots: &[PathBuf],
+    excluded: &HashSet<String>,
+    probes: &ProbeCache,
+) -> Vec<LocalTrack> {
+    let mut tracks = Vec::new();
+    let mut seen: HashSet<String> = excluded.iter().map(|rel| path_key(&cache_root.join(rel))).collect();
+    if !linked(cache_root) {
+        walk(cache_root, cache_root, 0, excluded, probes, &mut tracks, &mut seen);
+    }
+    for root in roots.iter().take(16) {
+        if tracks.len() >= MAX_TRACKS {
+            break;
+        }
+        if linked(root) || path_key(root) == path_key(cache_root) {
+            continue;
+        }
+        let start = tracks.len();
+        walk(root, root, 0, &HashSet::new(), probes, &mut tracks, &mut seen);
+        for track in &mut tracks[start..] {
+            track.id = format!("{LOCAL_ID_PREFIX}@{}:{}", root_key(root), track.rel);
+        }
+    }
+    let present: HashSet<String> = tracks.iter().map(|track| path_key(&track.path)).collect();
+    crate::lock(&probes.entries).retain(|path, _| present.contains(path));
+    tracks.sort_by_cached_key(|track| path_key(&track.path));
+    tracks
+}
+
 /// Recursively collects playable files under `root`, skipping paths already
 /// indexed as cache downloads (`excluded`, `/`-separated relative paths).
 /// Unreadable folders are skipped; symlinks and junctions are not followed
@@ -128,13 +201,15 @@ pub fn scan(root: &Path, excluded: &HashSet<String>) -> Vec<LocalTrack> {
 /// rescan happens on every visit of the list and after every download, and
 /// opening thousands of files each time (on a synced folder that can even
 /// download them) is what made it slow.
+#[cfg(test)]
 pub fn scan_with(root: &Path, excluded: &HashSet<String>, cache: &ProbeCache) -> Vec<LocalTrack> {
     let mut tracks = Vec::new();
-    walk(root, root, 0, excluded, cache, &mut tracks);
+    walk(root, root, 0, excluded, cache, &mut tracks, &mut HashSet::new());
     // A long-running app may see arbitrarily many replaced/deleted files;
     // retain only probes for files still present in this scan.
-    let present: HashSet<&str> = tracks.iter().map(|track| track.rel.as_str()).collect();
-    crate::lock(&cache.entries).retain(|rel, _| present.contains(rel.as_str()));
+    let present: HashSet<String> = tracks.iter().map(|track| path_key(&track.path)).collect();
+    let prefix = format!("{}/", path_key(root).trim_end_matches('/'));
+    crate::lock(&cache.entries).retain(|path, _| !path.starts_with(&prefix) || present.contains(path));
     tracks.sort_by_cached_key(|track| track.rel.to_lowercase());
     tracks
 }
@@ -164,15 +239,16 @@ impl ProbeCache {
 
     /// The tags of `path`: from the cache while `size` and `modified` still
     /// match, otherwise read from the file.
-    fn probe(&self, rel: &str, path: &Path, size: u64, modified: Option<SystemTime>) -> Probe {
-        if let Some(cached) = crate::lock(&self.entries).get(rel) {
+    fn probe(&self, path: &Path, size: u64, modified: Option<SystemTime>) -> Probe {
+        let key = path_key(path);
+        if let Some(cached) = crate::lock(&self.entries).get(&key) {
             if cached.size == size && cached.modified == modified {
                 return cached.probe.clone();
             }
         }
         let probe = probe_file(path);
         self.probed.fetch_add(1, Ordering::SeqCst);
-        crate::lock(&self.entries).insert(rel.to_owned(), ProbedFile { size, modified, probe: probe.clone() });
+        crate::lock(&self.entries).insert(key, ProbedFile { size, modified, probe: probe.clone() });
         probe
     }
 }
@@ -184,6 +260,7 @@ fn walk(
     excluded: &HashSet<String>,
     cache: &ProbeCache,
     tracks: &mut Vec<LocalTrack>,
+    seen: &mut HashSet<String>,
 ) {
     if depth > MAX_DEPTH || tracks.len() >= MAX_TRACKS {
         return;
@@ -198,9 +275,13 @@ fn walk(
             continue;
         }
         if kind.is_dir() {
-            walk(root, &entry.path(), depth + 1, excluded, cache, tracks);
+            walk(root, &entry.path(), depth + 1, excluded, cache, tracks, seen);
         } else if kind.is_file() {
+            if seen.contains(&path_key(&entry.path())) {
+                continue;
+            }
             if let Some(track) = track_for(root, &entry.path(), excluded, cache) {
+                seen.insert(path_key(&track.path));
                 tracks.push(track);
             }
         }
@@ -285,7 +366,7 @@ fn track_for(root: &Path, path: &Path, excluded: &HashSet<String>, cache: &Probe
     let (rel, suffix, size, modified) = audio_file(root, path, excluded)?;
     let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
     let (file_artist, file_title) = split_title(stem);
-    let probed = cache.probe(&rel, path, size, modified);
+    let probed = cache.probe(path, size, modified);
     let title = probed.title.unwrap_or_else(|| if file_title.trim().is_empty() { stem.to_owned() } else { file_title });
     let artist = probed.artist.unwrap_or(file_artist);
     let album = probed.album.unwrap_or_else(|| {
@@ -504,6 +585,56 @@ mod tests {
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ))
+    }
+
+    #[test]
+    fn multiple_roots_do_not_mix_same_named_files_or_follow_removed_roots() {
+        let root = temp_dir("multiple-roots");
+        let cached = root.join("cache");
+        let a = root.join("a");
+        let b = root.join("b");
+        for dir in [&cached, &a, &b] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        write_wav(&a.join("same.wav"), 1);
+        write_wav(&b.join("same.wav"), 2);
+        let probes = ProbeCache::default();
+        let roots = vec![a.clone(), b.clone(), a.clone()];
+        let tracks = scan_roots(&cached, &roots, &HashSet::new(), &probes);
+        assert_eq!(tracks.len(), 2);
+        assert_ne!(tracks[0].id, tracks[1].id);
+        assert!((tracks[0].duration - 1.0).abs() < 0.01);
+        assert!((tracks[1].duration - 2.0).abs() < 0.01);
+        assert_eq!(resolve(&tracks[0].id, &cached, &roots), Some(a.join("same.wav")));
+        assert_eq!(resolve(&tracks[1].id, &cached, std::slice::from_ref(&a)), None);
+        assert!(!in_roots(&tracks[1].id, std::slice::from_ref(&a)));
+        assert!(resolve(&format!("local:@{}:../b/same.wav", root_key(&a)), &cached, &roots).is_none());
+        assert!(resolve(&format!("local:@{}:C:/private.wav", root_key(&a)), &cached, &roots).is_none());
+        scan_roots(&cached, &roots, &HashSet::new(), &probes);
+        assert_eq!(probes.probed(), 2, "unchanged root files were reprobed");
+        scan_roots(&cached, &[a], &HashSet::new(), &probes);
+        assert_eq!(crate::lock(&probes.entries).len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn overlapping_roots_never_reintroduce_indexed_downloads() {
+        let root = temp_dir("overlapping-roots");
+        let cached = root.join("cache");
+        let nested = root.join("music/sub");
+        std::fs::create_dir_all(&cached).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        write_wav(&cached.join("download.wav"), 1);
+        write_wav(&nested.join("song.wav"), 1);
+        let tracks = scan_roots(
+            &cached,
+            &[root.join("music"), nested, root.clone()],
+            &HashSet::from(["download.wav".into()]),
+            &ProbeCache::default(),
+        );
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].title, "song");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -33,6 +33,8 @@ pub struct Session {
     #[serde(default)]
     pub index: usize,
     #[serde(default)]
+    pub position: f64,
+    #[serde(default)]
     pub shuffle: bool,
     #[serde(default)]
     pub repeat: Repeat,
@@ -65,18 +67,18 @@ impl Store {
                 let backup = self.path.with_extension(format!("corrupt-{stamp}.bak"));
                 self.save_blocked = backup.exists() || std::fs::rename(&self.path, backup).is_err();
                 let detail = if self.save_blocked {
-                    "сохранение заблокировано, прежний файл оставлен на месте"
+                    crate::i18n::tr("сохранение заблокировано, прежний файл оставлен на месте")
                 } else {
-                    "прежний файл сохранён отдельно"
+                    crate::i18n::tr("прежний файл сохранён отдельно")
                 };
-                (Session::default(), Some(format!("не удалось прочитать сессию: {detail}")))
+                (Session::default(), Some(crate::i18n::trf!("не удалось прочитать сессию: {detail}", detail = detail)))
             }
         }
     }
 
     pub fn save(&self, state: State<'_>) -> Result<(), String> {
         if self.save_blocked {
-            return Err("прежняя сессия недоступна; её файл не заменён".into());
+            return Err(crate::i18n::tr("прежняя сессия недоступна; её файл не заменён").into());
         }
         save_state(&self.path, state)
     }
@@ -100,6 +102,7 @@ fn read_session(path: &Path) -> Result<Session, ()> {
     }
     match serde_json::from_slice::<File>(&bytes) {
         Ok(File { version: 1, mut session }) => {
+            session.position = safe_position(session.position);
             session.queue.retain(|song| !song.id.is_empty());
             session.index = session.index.min(session.queue.len().saturating_sub(1));
             if session.song.as_ref().is_some_and(|song| song.id.is_empty()) {
@@ -113,9 +116,14 @@ fn read_session(path: &Path) -> Result<Session, ()> {
             if session.song.as_ref().is_some_and(|song| !session.queue.iter().any(|queued| queued.id == song.id)) {
                 session.song = None;
             }
+            if session.song.is_none() {
+                session.position = 0.0;
+            }
             if let Some(song) = &session.song {
-                if let Some(index) = session.queue.iter().position(|queued| queued.id == song.id) {
-                    session.index = index;
+                if session.queue.get(session.index).is_none_or(|queued| queued.id != song.id) {
+                    if let Some(index) = session.queue.iter().position(|queued| queued.id == song.id) {
+                        session.index = index;
+                    }
                 }
             }
             let (start, len, index) = queue_window(session.queue.len(), session.index);
@@ -133,6 +141,7 @@ pub struct State<'a> {
     pub song: &'a Option<Song>,
     pub queue: &'a [Song],
     pub index: usize,
+    pub position: f64,
     pub shuffle: bool,
     pub repeat: Repeat,
 }
@@ -146,6 +155,7 @@ pub fn save_to(path: &Path, session: &Session) -> Result<(), String> {
             song: &session.song,
             queue: &session.queue,
             index: session.index,
+            position: session.position,
             shuffle: session.shuffle,
             repeat: session.repeat,
         },
@@ -161,6 +171,7 @@ fn save_state(path: &Path, state: State<'_>) -> Result<(), String> {
         song: &'a Option<Song>,
         queue: &'a [Song],
         index: usize,
+        position: f64,
         shuffle: bool,
         repeat: Repeat,
     }
@@ -170,16 +181,25 @@ fn save_state(path: &Path, state: State<'_>) -> Result<(), String> {
         song: state.song,
         queue: &state.queue[start..start + len],
         index,
+        position: safe_position(state.position),
         shuffle: state.shuffle,
         repeat: state.repeat,
     })
-    .map_err(|e| format!("не удалось сохранить сессию: {e}"))?;
+    .map_err(|e| crate::i18n::trf!("не удалось сохранить сессию: {e}", e = e))?;
     if bytes.len() as u64 > MAX_BYTES {
-        return Err("сессия слишком большая; прежний файл не заменён".into());
+        return Err(crate::i18n::tr("сессия слишком большая; прежний файл не заменён").into());
     }
-    let parent = path.parent().ok_or("не удалось определить папку сессии")?;
-    std::fs::create_dir_all(parent).map_err(|e| format!("не удалось создать папку сессии: {e}"))?;
+    let parent = path.parent().ok_or(crate::i18n::tr("не удалось определить папку сессии"))?;
+    std::fs::create_dir_all(parent).map_err(|e| crate::i18n::trf!("не удалось создать папку сессии: {e}", e = e))?;
     atomic_write(path, &bytes)
+}
+
+pub fn safe_position(position: f64) -> f64 {
+    if position.is_finite() {
+        position.clamp(0.0, crate::api::MAX_DURATION_SECS)
+    } else {
+        0.0
+    }
 }
 
 /// At most `MAX_QUEUE` songs centred on `index`, with the index rebased.
@@ -234,6 +254,7 @@ mod tests {
                 song: &loaded.song,
                 queue: &loaded.queue,
                 index: 0,
+                position: 0.0,
                 shuffle: false,
                 repeat: Repeat::Off
             })
@@ -283,6 +304,7 @@ mod tests {
             song: Some(Song { id: "s3".into(), title: "T3".into(), ..Song::default() }),
             queue: songs(5),
             index: 3,
+            position: 12.5,
             shuffle: true,
             repeat: Repeat::One,
         };
@@ -291,6 +313,7 @@ mod tests {
         assert_eq!(loaded.song.as_ref().unwrap().id, "s3");
         assert_eq!(loaded.queue.len(), 5);
         assert_eq!(loaded.index, 3);
+        assert_eq!(loaded.position, 12.5);
         assert!(loaded.shuffle);
         assert_eq!(loaded.repeat, Repeat::One);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -312,6 +335,38 @@ mod tests {
         assert_eq!(loaded.queue.len(), MAX_QUEUE);
         assert_eq!(loaded.queue[loaded.index].id, "s4000", "the current track must stay in the window");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn position_is_bounded_and_old_sessions_remain_compatible() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -5.0] {
+            assert_eq!(safe_position(invalid), 0.0);
+        }
+        assert_eq!(safe_position(1e300), crate::api::MAX_DURATION_SECS);
+        let path = temp_path("old-position");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, br#"{"version":1,"song":{"id":"s"},"queue":[{"id":"s"}],"index":0}"#).unwrap();
+        let session = load_from(&path);
+        assert_eq!(session.position, 0.0);
+        assert_eq!(session.song.unwrap().id, "s");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn repeated_song_ids_keep_the_selected_queue_occurrence() {
+        let path = temp_path("duplicate-id");
+        let session = Session {
+            song: Some(songs(1).remove(0)),
+            queue: vec![songs(1).remove(0); 3],
+            index: 2,
+            position: 30.0,
+            ..Session::default()
+        };
+        save_to(&path, &session).unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.index, 2);
+        assert_eq!(loaded.position, 30.0);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

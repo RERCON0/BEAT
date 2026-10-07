@@ -68,7 +68,8 @@ pub fn spawn(client: Arc<Client>, cache: Cache, mode: Mode, tx: SyncSender<Event
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan(&client, &cache, mode, &path, &tx, &cancel)));
         crate::HANDLED_PANIC.with(|handled| handled.set(false));
-        let result = outcome.unwrap_or_else(|_| Err("внутренняя ошибка при проверке библиотеки".into()));
+        let result =
+            outcome.unwrap_or_else(|_| Err(crate::i18n::tr("внутренняя ошибка при проверке библиотеки").into()));
         if !cancel.load(Ordering::Relaxed) {
             let _ = tx.send(Event::Finished(result));
         }
@@ -104,18 +105,20 @@ fn scan(
         let page = client.catalog_albums(PAGE_SIZE, offset)?;
         let page_len = page.len();
         if page_len > PAGE_SIZE as usize {
-            return Err("сервер прислал больше альбомов, чем запрошено в одной странице".into());
+            return Err(crate::i18n::tr("сервер прислал больше альбомов, чем запрошено в одной странице").into());
         }
         for album in page {
             check_cancel(cancel)?;
             if !seen_albums.insert(album.id.clone()) {
-                return Err(
-                    "список альбомов изменился во время обхода или сервер повторяет страницу; повторите проверку"
-                        .into(),
-                );
+                return Err(crate::i18n::tr(
+                    "список альбомов изменился во время обхода или сервер повторяет страницу; повторите проверку",
+                )
+                .into());
             }
             if seen_albums.len() > MAX_ALBUMS {
-                return Err("слишком много альбомов: полный обход прерван, список не обрезан молча".into());
+                return Err(
+                    crate::i18n::tr("слишком много альбомов: полный обход прерван, список не обрезан молча").into()
+                );
             }
             let songs = client.catalog_album(&album.id)?;
             for song in songs {
@@ -132,12 +135,15 @@ fn scan(
                     + 256;
                 metadata_bytes = metadata_bytes.saturating_add(bytes as u64);
                 if metadata_bytes > MAX_STATE_BYTES {
-                    return Err(
-                        "метаданные библиотеки превышают 32 МБ; полный обход прерван, прежний список сохранён".into()
-                    );
+                    return Err(crate::i18n::tr(
+                        "метаданные библиотеки превышают 32 МБ; полный обход прерван, прежний список сохранён",
+                    )
+                    .into());
                 }
                 if seen_songs.len() > MAX_SONGS {
-                    return Err("слишком много песен: полный обход прерван, список не обрезан молча".into());
+                    return Err(
+                        crate::i18n::tr("слишком много песен: полный обход прерван, список не обрезан молча").into()
+                    );
                 }
                 if baseline {
                     known.insert(song.id);
@@ -166,7 +172,9 @@ fn scan(
         }
         // A server may cap responses below `size`; the next offset must be
         // based on what was actually received, not on what was requested.
-        offset = offset.checked_add(page_len as u32).ok_or("слишком много альбомов для постраничного обхода")?;
+        offset = offset
+            .checked_add(page_len as u32)
+            .ok_or(crate::i18n::tr("слишком много альбомов для постраничного обхода"))?;
     }
     check_cancel(cancel)?;
     if mode == Mode::Automatic {
@@ -181,7 +189,7 @@ fn scan(
 
 fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) {
-        Err("проверка библиотеки отменена".into())
+        Err(crate::i18n::tr("проверка библиотеки отменена").into())
     } else {
         Ok(())
     }
@@ -189,7 +197,7 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
 
 fn send(tx: &SyncSender<Event>, event: Event, cancel: &AtomicBool) -> Result<(), String> {
     check_cancel(cancel)?;
-    tx.send(event).map_err(|_| "проверка библиотеки отменена".to_owned())
+    tx.send(event).map_err(|_| crate::i18n::tr("проверка библиотеки отменена").to_owned())
 }
 
 /// Reads a file with a bound checked before anything is loaded; `Ok(None)` is
@@ -198,27 +206,30 @@ fn read_capped_file(path: &Path, cap: u64, what: &str) -> Result<Option<Vec<u8>>
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("не удалось прочитать {what}: {err}")),
+        Err(err) => return Err(crate::i18n::trf!("не удалось прочитать {what}: {err}", err = err, what = what)),
     };
     if file.metadata().map_err(|e| e.to_string())?.len() > cap {
-        return Err(format!("{what} слишком большой; файл сохранён без изменений"));
+        return Err(crate::i18n::trf!("{what} слишком большой; файл сохранён без изменений", what = what));
     }
     let mut bytes = Vec::new();
-    file.take(cap + 1).read_to_end(&mut bytes).map_err(|e| format!("не удалось прочитать {what}: {e}"))?;
+    file.take(cap + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| crate::i18n::trf!("не удалось прочитать {what}: {e}", e = e, what = what))?;
     if bytes.len() as u64 > cap {
-        return Err(format!("{what} слишком большой; файл сохранён без изменений"));
+        return Err(crate::i18n::trf!("{what} слишком большой; файл сохранён без изменений", what = what));
     }
     Ok(Some(bytes))
 }
 
 fn load_known(path: &Path) -> Result<Option<HashSet<String>>, String> {
-    let Some(bytes) = read_capped_file(path, MAX_STATE_BYTES, "список известных песен")? else {
+    let Some(bytes) = read_capped_file(path, MAX_STATE_BYTES, crate::i18n::tr("список известных песен"))?
+    else {
         return Ok(None);
     };
     let state: CatalogFile = serde_json::from_slice(&bytes)
-        .map_err(|_| "список известных песен повреждён; файл сохранён без изменений".to_owned())?;
+        .map_err(|_| crate::i18n::tr("список известных песен повреждён; файл сохранён без изменений").to_owned())?;
     if state.version != 1 || state.known.iter().any(String::is_empty) {
-        return Err("неподдерживаемый список известных песен; файл сохранён без изменений".into());
+        return Err(crate::i18n::tr("неподдерживаемый список известных песен; файл сохранён без изменений").into());
     }
     Ok(Some(state.known.into_iter().collect()))
 }
@@ -238,17 +249,18 @@ pub fn load_library(client: &Client) -> Result<Vec<Song>, String> {
 }
 
 pub fn load_library_from(path: &Path) -> Result<Vec<Song>, String> {
-    let Some(bytes) = read_capped_file(path, MAX_STATE_BYTES, "список песен сервера")? else {
+    let Some(bytes) = read_capped_file(path, MAX_STATE_BYTES, crate::i18n::tr("список песен сервера"))?
+    else {
         return Ok(Vec::new());
     };
     let file: LibraryFile = match serde_json::from_slice(&bytes) {
         Ok(file) => file,
         Err(_) => {
-            return Err(damaged_library(path, "список песен сервера повреждён"));
+            return Err(damaged_library(path, crate::i18n::tr("список песен сервера повреждён")));
         }
     };
     if file.version != 1 {
-        return Err(damaged_library(path, "неподдерживаемый список песен сервера"));
+        return Err(damaged_library(path, crate::i18n::tr("неподдерживаемый список песен сервера")));
     }
     Ok(file.songs.into_iter().filter(|song| crate::api::remote_id(&song.id)).collect())
 }
@@ -270,12 +282,13 @@ pub fn save_library_to(path: &Path, songs: &[Song]) -> Result<(), String> {
         songs: &'a [Song],
     }
     let bytes = serde_json::to_vec(&Ref { version: 1, songs })
-        .map_err(|e| format!("не удалось сохранить список песен сервера: {e}"))?;
+        .map_err(|e| crate::i18n::trf!("не удалось сохранить список песен сервера: {e}", e = e))?;
     if bytes.len() as u64 > MAX_STATE_BYTES {
-        return Err("список песен сервера слишком большой; прежний файл не заменён".into());
+        return Err(crate::i18n::tr("список песен сервера слишком большой; прежний файл не заменён").into());
     }
-    let parent = path.parent().ok_or("не удалось определить папку списка песен сервера")?;
-    std::fs::create_dir_all(parent).map_err(|e| format!("не удалось создать папку списка песен сервера: {e}"))?;
+    let parent = path.parent().ok_or(crate::i18n::tr("не удалось определить папку списка песен сервера"))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| crate::i18n::trf!("не удалось создать папку списка песен сервера: {e}", e = e))?;
     atomic_write(path, &bytes)
 }
 
@@ -284,11 +297,18 @@ fn damaged_library(path: &Path, problem: &str) -> String {
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let backup = path.with_extension(format!("corrupt-{stamp}.bak"));
     if backup.exists() {
-        return format!("{problem}; резервная копия недоступна, прежний файл оставлен на месте");
+        return crate::i18n::trf!(
+            "{problem}; резервная копия недоступна, прежний файл оставлен на месте",
+            problem = problem
+        );
     }
     match std::fs::rename(path, &backup) {
-        Ok(()) => format!("{problem}; старая копия сохранена рядом"),
-        Err(error) => format!("{problem}; не удалось сохранить копию: {error}; прежний файл оставлен на месте"),
+        Ok(()) => crate::i18n::trf!("{problem}; старая копия сохранена рядом", problem = problem),
+        Err(error) => crate::i18n::trf!(
+            "{problem}; не удалось сохранить копию: {error}; прежний файл оставлен на месте",
+            error = error,
+            problem = problem
+        ),
     }
 }
 
@@ -296,12 +316,13 @@ fn save_known(path: &Path, known: &HashSet<String>) -> Result<(), String> {
     let mut ids: Vec<String> = known.iter().cloned().collect();
     ids.sort_unstable();
     let bytes = serde_json::to_vec(&CatalogFile { version: 1, known: ids })
-        .map_err(|e| format!("не удалось сохранить список песен: {e}"))?;
+        .map_err(|e| crate::i18n::trf!("не удалось сохранить список песен: {e}", e = e))?;
     if bytes.len() as u64 > MAX_STATE_BYTES {
-        return Err("список известных песен слишком большой; прежний файл не заменён".into());
+        return Err(crate::i18n::tr("список известных песен слишком большой; прежний файл не заменён").into());
     }
-    let parent = path.parent().ok_or("не удалось определить папку списка песен")?;
-    std::fs::create_dir_all(parent).map_err(|e| format!("не удалось создать папку списка песен: {e}"))?;
+    let parent = path.parent().ok_or(crate::i18n::tr("не удалось определить папку списка песен"))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| crate::i18n::trf!("не удалось создать папку списка песен: {e}", e = e))?;
     atomic_write(path, &bytes)
 }
 

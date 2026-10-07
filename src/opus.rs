@@ -69,20 +69,21 @@ pub fn decode<R: Read + Seek + Send + Sync + 'static>(
         .tracks()
         .iter()
         .find(|track| track.codec_params.codec == CODEC_TYPE_OPUS)
-        .ok_or(Error::Unsupported("контейнер не содержит поддерживаемый Opus-трек"))?;
+        .ok_or(Error::Unsupported(crate::i18n::tr("контейнер не содержит поддерживаемый Opus-трек")))?;
     let params = track.codec_params.clone();
     let track_id = track.id;
-    let time_base = params.time_base.ok_or(Error::Unsupported("Opus без временной шкалы"))?;
-    let rate = SampleRate::new(params.sample_rate.unwrap_or(48_000)).ok_or(Error::Unsupported("частота Opus"))?;
+    let time_base = params.time_base.ok_or(Error::Unsupported(crate::i18n::tr("Opus без временной шкалы")))?;
+    let rate = SampleRate::new(params.sample_rate.unwrap_or(48_000))
+        .ok_or(Error::Unsupported(crate::i18n::tr("частота Opus")))?;
     let channels = params
         .channels
         .or_else(|| params.channel_layout.map(|layout| layout.into_channels()))
         .map(|channels| channels.count())
         .unwrap_or(0);
     if !(1..=2).contains(&channels) {
-        return Err(Error::Unsupported("Opus: поддерживаются моно и стерео"));
+        return Err(Error::Unsupported(crate::i18n::tr("Opus: поддерживаются моно и стерео")));
     }
-    let channels = ChannelCount::new(channels as u16).ok_or(Error::Unsupported("каналы Opus"))?;
+    let channels = ChannelCount::new(channels as u16).ok_or(Error::Unsupported(crate::i18n::tr("каналы Opus")))?;
     let gain = params
         .extra_data
         .as_deref()
@@ -228,7 +229,7 @@ impl OpusSource {
             self.offset = 0;
             return Ok(());
         }
-        Err(Error::DecodeError("Opus: слишком много повреждённых пакетов"))
+        Err(Error::DecodeError(crate::i18n::tr("Opus: слишком много повреждённых пакетов")))
     }
 }
 
@@ -284,7 +285,7 @@ impl Source for OpusSource {
             let desired_ts = self.time_base.calc_timestamp(target.into());
             let time = self.time_base.calc_time(desired_ts.saturating_sub(seeked.actual_ts));
             if time.seconds > 60 {
-                return Err(Error::LimitError("Opus: слишком большая дистанция точной перемотки"));
+                return Err(Error::LimitError(crate::i18n::tr("Opus: слишком большая дистанция точной перемотки")));
             }
             let mut remaining = ((time.seconds as f64 + time.frac) * f64::from(self.rate.get())).round() as u64;
             if seeked.actual_ts == 0 && self.ogg {
@@ -309,5 +310,5 @@ fn guarded<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
     let old = crate::HANDLED_PANIC.with(|handled| handled.replace(true));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
     crate::HANDLED_PANIC.with(|handled| handled.set(old));
-    result.unwrap_or(Err(Error::DecodeError("Opus: повреждённый поток")))
+    result.unwrap_or(Err(Error::DecodeError(crate::i18n::tr("Opus: повреждённый поток"))))
 }

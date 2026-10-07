@@ -74,7 +74,7 @@ impl Client {
             .redirect(redirect_policy(&base))
             .user_agent(concat!("beat/", env!("CARGO_PKG_VERSION")))
             .build()
-            .map_err(|e| format!("HTTP-клиент: {e}"))?;
+            .map_err(|e| crate::i18n::trf!("HTTP-клиент: {e}", e = e))?;
         // Audio reads can pause between chunks while the server transcodes;
         // the timeout applies per read operation, not to the whole download.
         let stream_http = reqwest::blocking::Client::builder()
@@ -83,7 +83,7 @@ impl Client {
             .redirect(redirect_policy(&base))
             .user_agent(concat!("beat/", env!("CARGO_PKG_VERSION")))
             .build()
-            .map_err(|e| format!("HTTP-клиент: {e}"))?;
+            .map_err(|e| crate::i18n::trf!("HTTP-клиент: {e}", e = e))?;
         Ok(Self {
             http,
             stream_http,
@@ -99,7 +99,7 @@ impl Client {
 
     fn url(&self, view: &str, params: &[(&str, &str)]) -> Result<reqwest::Url, String> {
         let mut url = reqwest::Url::parse(&format!("{}/rest/{view}", self.base))
-            .map_err(|_| "некорректный адрес запроса".to_string())?;
+            .map_err(|_| crate::i18n::tr("некорректный адрес запроса").to_string())?;
         {
             let mut query = url.query_pairs_mut();
             query.append_pair("u", &self.user);
@@ -118,13 +118,13 @@ impl Client {
     fn redact(&self, message: String) -> String {
         let mut out = message;
         if !self.password.is_empty() {
-            out = out.replace(&self.password, "[пароль скрыт]");
+            out = out.replace(&self.password, crate::i18n::tr("[пароль скрыт]"));
         }
         if !self.token.is_empty() {
-            out = out.replace(&self.token, "[токен скрыт]");
+            out = out.replace(&self.token, crate::i18n::tr("[токен скрыт]"));
         }
         if !self.salt.is_empty() {
-            out = out.replace(&self.salt, "[salt скрыт]");
+            out = out.replace(&self.salt, crate::i18n::tr("[salt скрыт]"));
         }
         out
     }
@@ -134,7 +134,8 @@ impl Client {
         let mut resp = self.http.get(url).send().map_err(|e| self.redact(describe_network_error(&e)))?;
         let status = resp.status();
         let body = read_capped(&mut resp, MAX_JSON_BYTES).map_err(|e| self.redact(e))?;
-        let text = String::from_utf8(body).map_err(|_| "сервер прислал некорректный UTF-8".to_string())?;
+        let text =
+            String::from_utf8(body).map_err(|_| crate::i18n::tr("сервер прислал некорректный UTF-8").to_string())?;
         if !status.is_success() {
             return Err(format!("HTTP {} — {}", status.as_u16(), snippet(&self.redact(text))));
         }
@@ -175,10 +176,10 @@ impl Client {
             &[("type", kind), ("size", &size.to_string()), ("offset", &offset.to_string())],
         )?;
         let Some(list) = v.get("albumList2").and_then(|list| list.as_object()) else {
-            return Err("сервер не прислал список альбомов".into());
+            return Err(crate::i18n::tr("сервер не прислал список альбомов").into());
         };
         if list.get("album").is_some_and(|albums| !albums.is_array()) {
-            return Err("сервер прислал некорректный список альбомов".into());
+            return Err(crate::i18n::tr("сервер прислал некорректный список альбомов").into());
         }
         // A malformed entry is dropped rather than failing the page: this list
         // only fills the album grid, where one broken row from a non-Navidrome
@@ -188,7 +189,7 @@ impl Client {
         if strict
             && list.get("album").and_then(|items| items.as_array()).is_some_and(|items| items.len() != albums.len())
         {
-            return Err("сервер прислал неполную страницу альбомов; полный обход прерван".into());
+            return Err(crate::i18n::tr("сервер прислал неполную страницу альбомов; полный обход прерван").into());
         }
         Ok(albums)
     }
@@ -199,13 +200,13 @@ impl Client {
     pub fn catalog_album(&self, id: &str) -> Result<Vec<Song>, String> {
         let v = self.get_json("getAlbum.view", &[("id", id)])?;
         let Some(album) = v.get("album").and_then(|album| album.as_object()) else {
-            return Err("сервер не прислал альбом для проверки библиотеки".into());
+            return Err(crate::i18n::tr("сервер не прислал альбом для проверки библиотеки").into());
         };
         if album.get("id").and_then(|value| value.as_str()) != Some(id) {
-            return Err("сервер прислал другой альбом для проверки библиотеки".into());
+            return Err(crate::i18n::tr("сервер прислал другой альбом для проверки библиотеки").into());
         }
         if album.get("song").is_some_and(|songs| !songs.is_array()) {
-            return Err("сервер прислал некорректный список песен".into());
+            return Err(crate::i18n::tr("сервер прислал некорректный список песен").into());
         }
         let songs = parse_album(&v).1;
         let declared_count = album
@@ -214,7 +215,7 @@ impl Client {
         if album.get("song").and_then(|songs| songs.as_array()).is_some_and(|raw| raw.len() != songs.len())
             || declared_count.is_some_and(|count| count != Some(songs.len() as u64))
         {
-            return Err("сервер прислал неполный список песен альбома".into());
+            return Err(crate::i18n::tr("сервер прислал неполный список песен альбома").into());
         }
         Ok(songs)
     }
@@ -240,7 +241,7 @@ impl Client {
         if !status.is_success() {
             let body = read_capped(&mut resp, MAX_COVER_BYTES).unwrap_or_default();
             let text = String::from_utf8_lossy(&body).into_owned();
-            return Err(format!("обложка: HTTP {} — {}", status.as_u16(), snippet(&self.redact(text))));
+            return Err(crate::i18n::trf!("обложка: HTTP {} — {}", status.as_u16(), snippet(&self.redact(text))));
         }
         read_capped(&mut resp, MAX_COVER_BYTES).map_err(|e| self.redact(e))
     }
@@ -262,7 +263,7 @@ impl Client {
         if !status.is_success() {
             let body = read_capped(&mut resp, 256 * 1024).unwrap_or_default();
             let text = String::from_utf8_lossy(&body).into_owned();
-            return Err(format!("поток: HTTP {} — {}", status.as_u16(), snippet(&self.redact(text))));
+            return Err(crate::i18n::trf!("поток: HTTP {} — {}", status.as_u16(), snippet(&self.redact(text))));
         }
         let total = content_length(&resp);
         // The server's content type is more reliable than the song suffix
@@ -317,11 +318,13 @@ fn redirect_policy(base: &str) -> reqwest::redirect::Policy {
     let base = reqwest::Url::parse(base).ok();
     reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() >= MAX_REDIRECTS {
-            return attempt.error("слишком много перенаправлений");
+            return attempt.error(crate::i18n::tr("слишком много перенаправлений"));
         }
         match &base {
             Some(base) if same_origin(base, attempt.url()) => attempt.follow(),
-            _ => attempt.error("сервер перенаправляет на другой адрес; укажите в настройках итоговый адрес сервера"),
+            _ => attempt.error(crate::i18n::tr(
+                "сервер перенаправляет на другой адрес; укажите в настройках итоговый адрес сервера",
+            )),
         }
     })
 }
@@ -332,8 +335,8 @@ fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
 
 /// Same rule as the rest of the family: HTTPS only, HTTP just for localhost.
 fn checked_base_url(raw: &str) -> Result<String, String> {
-    let url = reqwest::Url::parse(raw.trim()).map_err(|_| "некорректный адрес сервера".to_string())?;
-    let host = url.host_str().ok_or("адрес сервера без хоста")?;
+    let url = reqwest::Url::parse(raw.trim()).map_err(|_| crate::i18n::tr("некорректный адрес сервера").to_string())?;
+    let host = url.host_str().ok_or(crate::i18n::tr("адрес сервера без хоста"))?;
     // IPv6 hosts come back in brackets: `[::1]`.
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     let local = host == "localhost" || bare.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
@@ -343,7 +346,7 @@ fn checked_base_url(raw: &str) -> Result<String, String> {
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err("адрес сервера должен быть HTTPS (HTTP допустим только для localhost) и без логина, параметров или фрагмента".into());
+        return Err(crate::i18n::tr("адрес сервера должен быть HTTPS (HTTP допустим только для localhost) и без логина, параметров или фрагмента").into());
     }
     Ok(url.as_str().trim_end_matches('/').to_owned())
 }
@@ -389,16 +392,16 @@ fn read_capped(resp: &mut reqwest::blocking::Response, cap: usize) -> Result<Vec
     resp.by_ref()
         .take(cap as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| format!("не удалось прочитать ответ сервера: {e}"))?;
+        .map_err(|e| crate::i18n::trf!("не удалось прочитать ответ сервера: {e}", e = e))?;
     if bytes.len() > cap {
-        return Err("ответ сервера слишком большой".into());
+        return Err(crate::i18n::tr("ответ сервера слишком большой").into());
     }
     Ok(bytes)
 }
 
 fn describe_network_error(e: &reqwest::Error) -> String {
     if e.is_timeout() {
-        return "сеть: сервер не отвечает; проверьте адрес и соединение".into();
+        return crate::i18n::tr("сеть: сервер не отвечает; проверьте адрес и соединение").into();
     }
     let mut root = e.to_string();
     let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
@@ -406,7 +409,7 @@ fn describe_network_error(e: &reqwest::Error) -> String {
         root = err.to_string();
         source = err.source();
     }
-    format!("сеть: {root}")
+    crate::i18n::trf!("сеть: {root}", root = root)
 }
 
 fn snippet(body: &str) -> String {
@@ -607,22 +610,22 @@ pub struct SearchResult {
 /// `subsonic-response` envelope: `status` + an optional `error` object.
 fn parse_response(body: &str) -> Result<serde_json::Value, String> {
     let mut value: serde_json::Value =
-        serde_json::from_str(body).map_err(|_| "не удалось разобрать ответ сервера".to_string())?;
+        serde_json::from_str(body).map_err(|_| crate::i18n::tr("не удалось разобрать ответ сервера").to_string())?;
     // Taken out of the envelope, not cloned: the payload can be megabytes.
     let response = value
         .get_mut("subsonic-response")
         .map(serde_json::Value::take)
-        .ok_or("ответ не похож на Subsonic API (нет subsonic-response)")?;
+        .ok_or(crate::i18n::tr("ответ не похож на Subsonic API (нет subsonic-response)"))?;
     if response.get("status").and_then(|s| s.as_str()) != Some("ok") {
         let message = response
             .get("error")
             .and_then(|e| e.get("message"))
             .and_then(|m| m.as_str())
-            .unwrap_or("сервер отклонил запрос");
+            .unwrap_or(crate::i18n::tr("сервер отклонил запрос"));
         let code = response.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_u64());
         return Err(match code {
-            Some(code) => format!("сервер: {message} (код {code})"),
-            None => format!("сервер: {message}"),
+            Some(code) => crate::i18n::trf!("сервер: {message} (код {code})", code = code, message = message),
+            None => crate::i18n::trf!("сервер: {message}", message = message),
         });
     }
     Ok(response)

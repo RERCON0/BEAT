@@ -1,148 +1,155 @@
-<p align="center">
-  <img src="icons/beat-256.png" width="112" alt="Логотип BEAT">
-</p>
+<p align="center"><img src="icons/beat-256.png" width="112" alt="BEAT logo"></p>
 
 <h1 align="center">BEAT</h1>
 
+<p align="center"><strong>A lightweight Windows player for Navidrome and your own music.<br>One library. Fast playback. Your music stays available offline.</strong></p>
+
 <p align="center">
-  <strong>Лёгкий плеер для Navidrome и локальной музыки.<br>Одна библиотека, потоковое воспроизведение и музыка без сети.</strong>
+<a href="https://github.com/RERCON0/BEAT/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/RERCON0/BEAT/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+<a href="https://github.com/RERCON0/BEAT/actions/workflows/security.yml"><img alt="Security" src="https://github.com/RERCON0/BEAT/actions/workflows/security.yml/badge.svg?branch=main"></a>
+<a href="#build"><img alt="Windows x64" src="https://img.shields.io/badge/Windows-x64-0078D4?logo=windows&logoColor=white"></a>
+<a href="https://t.me/rercon"><img alt="Telegram" src="https://img.shields.io/badge/Telegram-@rercon-26A5E4?logo=telegram&logoColor=white"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/RERCON0/BEAT/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/RERCON0/BEAT/actions/workflows/ci.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/RERCON0/BEAT/actions/workflows/security.yml"><img alt="Security" src="https://github.com/RERCON0/BEAT/actions/workflows/security.yml/badge.svg?branch=main"></a>
-  <a href="#сборка"><img alt="Windows x64" src="https://img.shields.io/badge/Windows-x64-0078D4?logo=windows&logoColor=white"></a>
-  <a href="https://t.me/rercon"><img alt="Telegram" src="https://img.shields.io/badge/Telegram-@rercon-26A5E4?logo=telegram&logoColor=white"></a>
+<a href="README.md">English</a> · <a href="README.ru.md">Русский</a><br>
+<a href="#features">Features</a> · <a href="#quick-start">Quick start</a> · <a href="#build">Build</a> ·
+<a href="#settings-and-data">Data</a> · <a href="docs/REFERENCE.md">Reference (RU)</a>
 </p>
 
-<p align="center">
-  <a href="#возможности">Возможности</a> ·
-  <a href="#быстрый-старт">Быстрый старт</a> ·
-  <a href="#сборка">Сборка</a> ·
-  <a href="#настройки-и-данные">Данные</a> ·
-  <a href="docs/REFERENCE.md">Справочник</a>
-</p>
-
-BEAT написан на Rust и работает в нативном окне без Electron. Подключите
-[Navidrome](https://www.navidrome.org/) или добавьте свою музыку: скачанные
-треки остаются обычными файлами, а плеер продолжает работать без сервера.
+BEAT is written in Rust and runs in a native window without Electron.
+Connect [Navidrome](https://www.navidrome.org/) or add your music folders.
+Downloaded tracks remain ordinary files; local playback works without a server.
 
 > [!NOTE]
-> BEAT находится в разработке. Основной способ запуска — сборка из исходников.
-> CI проверяет Windows x64 и сохраняет тестовую сборку.
+> BEAT is in development. Build from source or use a test artifact from a
+> successful Windows CI run. Public releases will come later.
 
-## Возможности
+<img src="docs/screenshots/beat-dark.png" width="1280" alt="BEAT dark theme with a demonstration music library">
 
-| | Что умеет BEAT |
+<details>
+<summary>Light theme</summary>
+<img src="docs/screenshots/beat-light.png" width="1280" alt="BEAT light theme with the same demonstration music library">
+</details>
+
+*Screenshots use demo track names and original placeholder artwork. No audio files are included. Both themes support EN/RU.*
+
+## Features
+
+| | What BEAT does |
 |---|---|
-| **Общая библиотека** | Серверные песни, скачанные треки и локальные файлы в одном списке; быстрый фильтр по названию, артисту и альбому |
-| **Обзор и поиск** | Артисты, альбомы, обложки и поиск на сервере и диске; локальные альбомы доступны без Navidrome |
-| **Плеер** | Очередь, перемотка, громкость, случайный порядок, повтор списка или трека; восстановление последней сессии |
-| **Загрузки** | Один трек, альбом или вся библиотека; до трёх загрузок одновременно и автокеширование новых песен |
-| **Без сети** | Воспроизведение скачанного и собственной музыки; теги и обложки читаются из файлов |
-| **На каждый день** | Светлая и тёмная темы, история прослушиваний, кеш обложек и восстановление вывода после потери аудиоустройства |
+| **Lightweight** | Native Rust application, bundled fonts and codecs, no browser runtime or separate codec installation |
+| **One library** | Server songs, cached downloads and up to 16 local folders in one list; instant title, artist and album filter |
+| **Browse and search** | Artists, albums, embedded artwork and search across the server and local music |
+| **Playback queue** | Open from the status bar; play a selected track, reorder or remove entries, or keep only the current track |
+| **Ready for the next song** | Prepares the next local or fully cached track for a gapless transition; predownloads the next server track within the download limit |
+| **Windows controls** | System media controls and compatible keyboard/headset play, pause, previous and next buttons, including while minimized |
+| **Pick up where you left off** | Restores the last track, its position, queue, shuffle and repeat; playback starts when you press **▶** |
+| **Downloads** | A track, album or the whole library; up to three downloads at once; optional automatic caching of new songs |
+| **Offline and bilingual** | Your files and finished downloads work without a server; dark/light themes and a saved EN/RU switch in the title bar |
+| **Defensive handling** | Windows DPAPI for passwords, account separation, restricted redirects and paths, bounded media/cover parsing; CI and security checks |
 
-Поддерживаются MP3, FLAC, OGG/Vorbis, **Opus** (моно и стерео в Ogg/WebM),
-WAV и распространённые варианты AAC/M4A/MP4. Opus-декодер встроен;
-внешний кодек для запуска не нужен. Воспроизведение начинается после получения буфера; перемотка
-при загрузке доступна в пределах уже скачанного.
+MP3, FLAC, OGG/Vorbis, **Opus** (mono/stereo in Ogg/WebM), WAV and common
+AAC/M4A/MP4 variants are supported. Opus is bundled. Streaming starts after
+buffering; seeking during download is limited to the data already received.
 
 > [!IMPORTANT]
-> После перезапуска BEAT восстанавливает последний трек и очередь, но сам не
-> включает воспроизведение. Нажмите **▶** — трек начнётся с начала.
+> Gapless playback needs the next file to be ready in time. A slow server or
+> an unfinished download can still require buffering. Silence already present
+> in the recording is preserved.
 
-## Быстрый старт
+## Quick start
 
-### С Navidrome
+### With Navidrome
 
-1. Откройте **Настройки** и укажите адрес сервера, логин и пароль.
-2. Нажмите **Проверить связь**, затем **Сохранить**.
-3. Откройте библиотеку, альбомы или поиск. **▶** играет трек, **↓** скачивает его.
+1. Open **Settings**, enter the server address, username and password.
+2. Select **Test connection**, then **Save**.
+3. Open the library, an album or search. **▶** plays; **↓** downloads.
 
-Адрес может включать подпапку, например `https://music.example.com/library`;
-дописывать `/rest` не нужно. Для удалённого сервера требуется HTTPS, HTTP
-допускается только для `localhost` и loopback-адресов.
+The address may include a subfolder, such as `https://music.example.com/library`;
+do not append `/rest`. Remote servers require HTTPS; HTTP is allowed only for
+`localhost` and loopback addresses.
 
 > [!TIP]
-> Автокеширование сначала запоминает существующие песни и затем скачивает новые.
-> Чтобы забрать всю библиотеку сразу, используйте **«↓ скачать все песни»**.
-> Уже скачанные треки пропускаются.
+> Automatic caching first remembers the existing songs, then downloads new
+> additions. To fetch the whole library now, select **↓ download all songs**.
+> Tracks already downloaded are skipped.
 
-### Со своей музыкой
+### With your music
 
-1. Нажмите **Открыть папку кеша** или выберите другой каталог в настройках.
-2. Скопируйте туда аудиофайлы; подпапки тоже поддерживаются.
-3. Откройте библиотеку и при необходимости нажмите **Обновить**.
+1. Open **Settings** and add your music folders. Files stay in their original locations.
+2. Open **Library** and select **Refresh** if needed. Subfolders are included.
+3. Press **▶**; click the queue count in the status bar to edit the playing list.
 
-По умолчанию используется системная папка **Музыка → BEAT**. Сервер для
-локального воспроизведения не нужен. Личные файлы не отправляются в Navidrome;
-очистка кеша затрагивает только загрузки, записанные в индекс BEAT.
+The cache defaults to the system **Music → BEAT** folder and can be changed.
+You can also place your own files there. Local files are never uploaded to
+Navidrome; clearing the cache affects only BEAT's indexed downloads.
 
-Подробности очереди, автокеширования, транскодирования, поиска и восстановления
-аудиоустройства — в [справочнике](docs/REFERENCE.md).
+Use **RU / EN** in the title bar to switch language and **light / dark** to
+switch theme. Both choices persist across restarts.
 
-## Сборка
+## Build
 
-Основная платформа — **Windows x64**. Нужны Rustup, Visual Studio Build Tools
-с инструментами C++ и Windows SDK, CMake 3.16+ для сборки встроенного libopus,
-графический драйвер с OpenGL 2.1+
-и рабочее устройство вывода звука. Rust и инструменты проверки закреплены
-в [rust-toolchain.toml](rust-toolchain.toml).
+Target: **Windows x64**. Install Rustup, Visual Studio Build Tools with C++
+and the Windows SDK, and CMake 3.16+ for bundled libopus. Running BEAT needs
+OpenGL 2.1+ and an audio output device. Rust is pinned in
+[rust-toolchain.toml](rust-toolchain.toml).
 
-В PowerShell из корня репозитория:
+From the repository root in PowerShell:
 
 ```powershell
 cargo build --locked --release --bin beat
 .\target\release\beat.exe
 ```
 
-Сервер и музыкальная библиотека для сборки не требуются. Иконка и шрифт
-встроены в EXE; приложение можно запускать из Проводника.
-Рантайм MSVC линкуется статически, Visual C++ Redistributable не нужен.
+A server or music library is not required to build. The icon, fonts and Opus
+decoder are bundled; launch the EXE from Explorer. MSVC is linked statically,
+so Visual C++ Redistributable is not required.
 
 > [!NOTE]
-> Сборки пока не имеют Authenticode-подписи. SmartScreen может предупредить
-> о неизвестном приложении. Если вы доверяете источнику сборки, доступны
-> **«Подробнее» → «Выполнить в любом случае»**. SHA-256 сам по себе не подтверждает издателя.
+> Builds do not currently have an Authenticode signature. SmartScreen may
+> warn about an unknown app. If you trust the build's source, choose
+> **More info → Run anyway**. A SHA-256 hash alone does not identify the publisher.
 
-## Настройки и данные
+## Settings and data
 
-| Где | Что хранится |
+| Location | Contents |
 |---|---|
-| `%APPDATA%\beat` | Настройки, последний трек и очередь, история прослушиваний, списки серверных песен |
-| `%APPDATA%\beat\covers` | Ограниченный кеш миниатюр обложек |
-| **Музыка → BEAT** или выбранный каталог | Аудиофайлы и отдельные индексы `.beat-index-*.json` |
+| `%APPDATA%\beat` | Settings, language, last track and position, queue, play counts and server lists |
+| `%APPDATA%\beat\covers` | Bounded thumbnail cache |
+| **Music → BEAT** or your chosen cache folder | Downloads and separate `.beat-index-*.json` files |
+| Additional music folders | Your original audio files; BEAT reads them in place |
 
-На Windows пароль защищён DPAPI текущего пользователя. Индексы загрузок,
-серверные списки и обложки разделены по серверу и аккаунту; история и сессия
-также учитывают папку музыки. Файлы прежнего аккаунта остаются доступны как
-локальная музыка. Очистка кеша удаляет только индексированные загрузки
-текущего аккаунта. Повреждённые данные сохраняются для восстановления;
-ошибки чтения и записи показываются в приложении.
+Passwords use Windows DPAPI for the current user. Downloads, server lists and
+covers are scoped to the server/account; history and sessions also account for
+the cache folder. Old account files remain accessible as local music. Clearing
+the cache deletes only the current account's indexed downloads. Removing a
+music folder from Settings does not delete its files. Damaged state files are
+preserved for recovery; read/write failures are visible.
 
 > [!CAUTION]
-> Незавершённые `*.part` после аварийного закрытия проверяйте и удаляйте только
-> при закрытом BEAT. Не передавайте другим свои настройки и пароль сервера.
+> Inspect or remove unfinished `*.part` files left by a crash only while BEAT
+> is closed. Do not share your account settings or server password.
 
-## Разработка
+## Development
 
 ```powershell
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 python -B scripts/check_docs.py
+python -B scripts/update_i18n.py --check
 ```
 
-CI проверяет код и оптимизированную сборку; Security ежедневно проверяет
-Cargo.lock и сканирует всю историю Git на секреты. Actions закреплены полными
-SHA, Dependabot предлагает обновления еженедельно. Артефакты CI содержат
-неподписанный EXE, хеш, сведения об исходном коммите и уведомления компонентов.
+CI checks code, translations, documentation and the optimized Windows build.
+Security checks Cargo.lock daily and scans the entire Git history for secrets.
+Actions use full commit pins; Dependabot proposes weekly updates. CI artifacts
+include the unsigned EXE, SHA-256, source revision and component notices.
 
-- [Справочник](docs/REFERENCE.md) — подробное поведение и структура проекта.
-- [Безопасность](SECURITY.md) — границы защиты и известные предупреждения зависимостей.
-- [Аудит перед публикацией](docs/AUDIT-2026-10-07.md) — исправления и результаты проверки.
-- [Иконка](icons/README.md) — исходники и экспорт ресурсов.
-- [Шрифт Cascadia Mono](fonts/OFL-notice.txt) — происхождение и [полный текст лицензии](fonts/OFL.txt).
-- [Встроенный Opus и изменения Symphonia](third_party/README.md) — происхождение и лицензии компонентов.
+- [Reference (RU)](docs/REFERENCE.md) — queue, streaming, caching and project structure.
+- [Security (RU)](SECURITY.md) — protection boundaries and dependency warnings.
+- [Audit before publication (RU)](docs/AUDIT-2026-10-07.md) — fixes and verification.
+- [Icon](icons/README.md) · [Cascadia Mono notice](fonts/OFL-notice.txt) and [license](fonts/OFL.txt).
+- [Bundled audio and Windows components](third_party/README.md) — sources and licenses.
 
-Автор — rercon prod. · [Telegram](https://t.me/rercon)
+rercon prod. · [Telegram](https://t.me/rercon)

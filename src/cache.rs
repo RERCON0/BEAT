@@ -112,6 +112,13 @@ struct LoadedIndex {
 }
 
 impl Cache {
+    pub fn preview(root: PathBuf) -> Self {
+        Self::from_loaded(
+            root,
+            INDEX_FILE.into(),
+            LoadedIndex { tracks: HashMap::new(), warning: None, save_blocked: true },
+        )
+    }
     pub fn load(root: PathBuf) -> Cache {
         let stamp =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
@@ -136,7 +143,10 @@ impl Cache {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
         let mut loaded = load_index_file(&root, stamp, &name);
         if let Some(error) = migration_error {
-            loaded.warning = Some(format!("не удалось перенести прежний индекс кеша: {error}; аудиофайлы сохранены"));
+            loaded.warning = Some(crate::i18n::trf!(
+                "не удалось перенести прежний индекс кеша: {error}; аудиофайлы сохранены",
+                error = error
+            ));
         }
         Self::from_loaded(root, name, loaded)
     }
@@ -224,12 +234,12 @@ impl Cache {
         let index = crate::lock(&self.inner.index);
         let mut reserved = crate::lock(&self.inner.reserved);
         if let Some(entry) = index.get(&song.id) {
-            let path = self.resolve_rel(&entry.path).ok_or("путь трека в индексе кеша небезопасен")?;
+            let path = self.resolve_rel(&entry.path).ok_or(crate::i18n::tr("путь трека в индексе кеша небезопасен"))?;
             if path.exists() {
-                return Err("трек уже находится в кеше".into());
+                return Err(crate::i18n::tr("трек уже находится в кеше").into());
             }
             if reserved.contains(&entry.path.to_lowercase()) {
-                return Err("трек уже загружается".into());
+                return Err(crate::i18n::tr("трек уже загружается").into());
             }
             reserved.insert(entry.path.to_lowercase());
             let part = part_path(&path);
@@ -246,7 +256,9 @@ impl Cache {
             counter += 1;
             candidate = numbered_path(&rel, counter);
         }
-        let path = self.resolve_rel(&candidate).ok_or("папка назначения кеша содержит ссылку или небезопасный путь")?;
+        let path = self
+            .resolve_rel(&candidate)
+            .ok_or(crate::i18n::tr("папка назначения кеша содержит ссылку или небезопасный путь"))?;
         reserved.insert(candidate.to_lowercase());
         let part = part_path(&path);
         Ok((path, part))
@@ -270,7 +282,7 @@ impl Cache {
     /// Records a finished download; saves the index immediately.
     pub fn insert(&self, entry: CachedTrack) -> Result<(), String> {
         if self.resolve_rel(&entry.path).is_none() {
-            return Err("путь трека выходит за пределы папки кеша".into());
+            return Err(crate::i18n::tr("путь трека выходит за пределы папки кеша").into());
         }
         {
             let mut index = crate::lock(&self.inner.index);
@@ -282,9 +294,9 @@ impl Cache {
 
     /// Deletes an indexed file; one that is already gone counts as deleted.
     fn delete_file(&self, entry: &CachedTrack) -> std::io::Result<()> {
-        let path = self
-            .resolve_rel(&entry.path)
-            .ok_or_else(|| std::io::Error::other("путь файла содержит ссылку или выходит за пределы кеша"))?;
+        let path = self.resolve_rel(&entry.path).ok_or_else(|| {
+            std::io::Error::other(crate::i18n::tr("путь файла содержит ссылку или выходит за пределы кеша"))
+        })?;
         match std::fs::remove_file(path) {
             Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
             _ => Ok(()),
@@ -302,7 +314,7 @@ impl Cache {
             if let Err(err) = self.delete_file(&entry) {
                 crate::lock(&self.inner.index).insert(entry.id.clone(), entry);
                 self.refresh_stats();
-                return Err(format!("не удалось удалить файл: {err}"));
+                return Err(crate::i18n::trf!("не удалось удалить файл: {err}", err = err));
             }
         }
         self.refresh_stats();
@@ -329,7 +341,7 @@ impl Cache {
         if count == 0 {
             Ok(())
         } else {
-            Err(format!("не удалось удалить файлов: {count}"))
+            Err(crate::i18n::trf!("не удалось удалить файлов: {count}", count = count))
         }
     }
 
@@ -418,7 +430,10 @@ impl Cache {
 
     fn save_index(&self) -> Result<(), String> {
         if self.inner.save_blocked {
-            return Err("индекс кеша не был прочитан; сохранение заблокировано во избежание потери данных".into());
+            return Err(crate::i18n::tr(
+                "индекс кеша не был прочитан; сохранение заблокировано во избежание потери данных",
+            )
+            .into());
         }
         // One writer at a time, each taking its snapshot only once it holds the
         // writer lock: an older snapshot never lands after a newer one, and the
@@ -433,9 +448,10 @@ impl Cache {
             serde_json::to_vec(&IndexFileRef { version: 1, tracks: &index }).map_err(|e| e.to_string())?
         };
         if raw.len() as u64 > MAX_INDEX_BYTES {
-            return Err("индекс кеша слишком большой".into());
+            return Err(crate::i18n::tr("индекс кеша слишком большой").into());
         }
-        std::fs::create_dir_all(&self.inner.root).map_err(|e| format!("не удалось создать кеш: {e}"))?;
+        std::fs::create_dir_all(&self.inner.root)
+            .map_err(|e| crate::i18n::trf!("не удалось создать кеш: {e}", e = e))?;
         atomic_write(&self.inner.root.join(&self.inner.index_name), &raw)
     }
 }
@@ -473,20 +489,27 @@ fn load_index_file(root: &Path, stamp: u128, name: &str) -> LoadedIndex {
                 })
                 .collect();
             let dropped = total - tracks.len();
-            let warning =
-                (dropped > 0).then(|| format!("в индексе кеша пропущено записей с небезопасным путём: {dropped}"));
+            let warning = (dropped > 0).then(|| {
+                crate::i18n::trf!("в индексе кеша пропущено записей с небезопасным путём: {dropped}", dropped = dropped)
+            });
             LoadedIndex { tracks, warning, save_blocked: false }
         }
         _ => match set_aside(&path, stamp) {
             Some(name) => LoadedIndex {
                 tracks: HashMap::new(),
-                warning: Some(format!("индекс кеша повреждён и начат заново; старый файл сохранён как {name}")),
+                warning: Some(crate::i18n::trf!(
+                    "индекс кеша повреждён и начат заново; старый файл сохранён как {name}",
+                    name = name
+                )),
                 save_blocked: false,
             },
             None => LoadedIndex {
                 tracks: HashMap::new(),
                 warning: Some(
-                    "индекс кеша повреждён; копию сделать не удалось, сохранение индекса заблокировано".into(),
+                    crate::i18n::tr(
+                        "индекс кеша повреждён; копию сделать не удалось, сохранение индекса заблокировано",
+                    )
+                    .into(),
                 ),
                 save_blocked: true,
             },
@@ -515,12 +538,12 @@ fn read_capped(path: &Path, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
         Err(err) => return Err(err),
     };
     if file.metadata()?.len() > cap {
-        return Err(std::io::Error::other("файл индекса слишком большой"));
+        return Err(std::io::Error::other(crate::i18n::tr("файл индекса слишком большой")));
     }
     let mut bytes = Vec::new();
     file.take(cap + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > cap {
-        return Err(std::io::Error::other("файл индекса слишком большой"));
+        return Err(std::io::Error::other(crate::i18n::tr("файл индекса слишком большой")));
     }
     Ok(Some(bytes))
 }
@@ -544,7 +567,7 @@ pub fn is_safe_rel(rel: &str) -> bool {
 
 /// Refuse existing symlinks and Windows junctions at every level: a lexical
 /// path inside the cache can otherwise resolve outside it when read or deleted.
-fn safe_path(root: &Path, rel: &str) -> Option<PathBuf> {
+pub(crate) fn safe_path(root: &Path, rel: &str) -> Option<PathBuf> {
     checked_path(root, rel).ok()
 }
 
@@ -781,7 +804,7 @@ impl Progress {
         let mut state = crate::lock(&self.state);
         loop {
             if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
-                return Err("воспроизведение остановлено".into());
+                return Err(crate::i18n::tr("воспроизведение остановлено").into());
             }
             if let Some(err) = &state.failed {
                 return Err(err.clone());
@@ -790,11 +813,11 @@ impl Progress {
                 return Ok(());
             }
             if nonblocking.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
-                return Err("декодеру нужно дождаться дополнительных данных".into());
+                return Err(crate::i18n::tr("декодеру нужно дождаться дополнительных данных").into());
             }
             let now = std::time::Instant::now();
             if now >= deadline {
-                return Err("сервер слишком медленно отдаёт трек".into());
+                return Err(crate::i18n::tr("сервер слишком медленно отдаёт трек").into());
             }
             // The flag is not tied to the condvar: look at it regularly.
             let mut wait = deadline - now;
@@ -874,7 +897,8 @@ pub struct GrowingReader {
 
 impl GrowingReader {
     pub fn open(progress: Arc<Progress>, path: &Path) -> Result<Self, String> {
-        let file = std::fs::File::open(path).map_err(|e| format!("не удалось открыть {}: {e}", path.display()))?;
+        let file = std::fs::File::open(path)
+            .map_err(|e| crate::i18n::trf!("не удалось открыть {}: {e}", path.display(), e = e))?;
         Ok(Self {
             progress,
             file,
@@ -902,7 +926,7 @@ impl GrowingReader {
             if failed.is_none() && !finished && downloaded < needed {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WouldBlock,
-                    "декодеру нужно дождаться дополнительных данных",
+                    crate::i18n::tr("декодеру нужно дождаться дополнительных данных"),
                 ));
             }
         }
@@ -1035,7 +1059,7 @@ fn guarded<T>(step: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     crate::HANDLED_PANIC.with(|handled| handled.set(true));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(step));
     crate::HANDLED_PANIC.with(|handled| handled.set(false));
-    outcome.unwrap_or_else(|_| Err("внутренняя ошибка при загрузке трека".into()))
+    outcome.unwrap_or_else(|_| Err(crate::i18n::tr("внутренняя ошибка при загрузке трека").into()))
 }
 
 /// Picks the destination, writes the stream there and cleans up after a
@@ -1090,42 +1114,43 @@ fn run_download(
     let mut reader = stream.reader;
     let max_bytes = cache.inner.max_track_bytes.load(Ordering::SeqCst);
     if total.is_some_and(|total| total > max_bytes) {
-        return Err("сервер прислал слишком большой файл".into());
+        return Err(crate::i18n::tr("сервер прислал слишком большой файл").into());
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("не удалось создать {parent:?}: {e}"))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| crate::i18n::trf!("не удалось создать {parent:?}: {e}", e = e, parent = parent))?;
     }
     let mut cleanup = PartCleanup { path: part, created: false };
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(part)
-        .map_err(|e| format!("не удалось создать {}: {e}", part.display()))?;
+        .map_err(|e| crate::i18n::trf!("не удалось создать {}: {e}", part.display(), e = e))?;
     cleanup.created = true;
     progress.opened(part.to_path_buf(), total);
     let mut buf = vec![0u8; 64 * 1024];
     let mut written: u64 = 0;
     loop {
-        let n = reader.read(&mut buf).map_err(|e| format!("поток оборвался: {e}"))?;
+        let n = reader.read(&mut buf).map_err(|e| crate::i18n::trf!("поток оборвался: {e}", e = e))?;
         if n == 0 {
             break;
         }
         if written + n as u64 > max_bytes {
-            return Err("поток превысил допустимый размер файла".into());
+            return Err(crate::i18n::tr("поток превысил допустимый размер файла").into());
         }
-        file.write_all(&buf[..n]).map_err(|e| format!("не удалось записать кеш: {e}"))?;
+        file.write_all(&buf[..n]).map_err(|e| crate::i18n::trf!("не удалось записать кеш: {e}", e = e))?;
         written += n as u64;
         progress.add(n as u64);
     }
-    file.sync_all().map_err(|e| format!("не удалось сохранить кеш: {e}"))?;
+    file.sync_all().map_err(|e| crate::i18n::trf!("не удалось сохранить кеш: {e}", e = e))?;
     drop(file);
     if written == 0 {
-        return Err("сервер прислал пустой трек".into());
+        return Err(crate::i18n::tr("сервер прислал пустой трек").into());
     }
     // A known Content-Length that does not match means a broken download.
     if let Some(total) = progress.snapshot().1 {
         if written < total {
-            return Err("поток оборвался до конца трека".into());
+            return Err(crate::i18n::tr("поток оборвался до конца трека").into());
         }
     }
     // A `200 OK` can still carry an HTML error page or a JSON body. Renaming
@@ -1137,9 +1162,9 @@ fn run_download(
         .is_none()
         || path.exists()
     {
-        return Err("путь файла кеша изменился во время загрузки".into());
+        return Err(crate::i18n::tr("путь файла кеша изменился во время загрузки").into());
     }
-    std::fs::rename(part, path).map_err(|e| format!("не удалось завершить файл кеша: {e}"))?;
+    std::fs::rename(part, path).map_err(|e| crate::i18n::trf!("не удалось завершить файл кеша: {e}", e = e))?;
     cleanup.created = false;
     progress.set_total(Some(written));
     let relative = path.strip_prefix(cache.root()).unwrap_or(path).to_string_lossy().replace('\\', "/");

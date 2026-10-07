@@ -12,7 +12,10 @@ pub fn validate_metadata(reader: &mut (impl Read + Seek)) -> std::io::Result<()>
 }
 
 fn invalid() -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, "слишком большие или повреждённые метаданные аудио")
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        crate::i18n::tr("слишком большие или повреждённые метаданные аудио"),
+    )
 }
 
 fn validate(reader: &mut (impl Read + Seek)) -> std::io::Result<()> {

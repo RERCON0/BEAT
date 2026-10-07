@@ -6,9 +6,9 @@ use crate::api::MAX_DURATION_SECS;
 use crate::cache::{GrowingReader, Progress};
 use rodio::cpal::traits::HostTrait;
 use rodio::Decoder;
-use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player as Output};
+use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player as Output, Source};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,12 +28,16 @@ pub struct Player {
     /// dead stream plays nothing and makes `try_seek` block forever, so the
     /// app rebuilds the output instead of using it.
     stream_error: Arc<AtomicBool>,
+    clock: Arc<crate::playback::Clock>,
+    serial: AtomicU64,
+    next: Mutex<Option<Arc<crate::playback::NextSlot>>>,
 }
 
 impl Player {
     pub fn new(volume: f32) -> Result<Self, String> {
         let stream_error = Arc::new(AtomicBool::new(false));
-        let sink = open_sink(stream_error.clone()).map_err(|e| format!("аудиовыход недоступен: {e}"))?;
+        let sink =
+            open_sink(stream_error.clone()).map_err(|e| crate::i18n::trf!("аудиовыход недоступен: {e}", e = e))?;
         let output = Output::connect_new(sink.mixer());
         output.set_volume(volume);
         Ok(Self {
@@ -43,6 +47,9 @@ impl Player {
             stream_cancel: Mutex::new(None),
             stream_startup: Mutex::new(None),
             stream_error,
+            clock: Arc::new(crate::playback::Clock::default()),
+            serial: AtomicU64::new(1),
+            next: Mutex::new(None),
         })
     }
 
@@ -61,15 +68,34 @@ impl Player {
     }
 
     pub fn play_file(&self, path: &Path) -> Result<(), String> {
-        let decoder = open_file_decoder(path)?;
+        self.play_file_at(path, 0.0)
+    }
+
+    pub fn play_file_at(&self, path: &Path, position: f64) -> Result<(), String> {
+        if self.has_stream_error() {
+            return Err(crate::i18n::tr("аудиоустройство недоступно").into());
+        }
+        let mut decoder = open_file_decoder(path)?;
+        let position = crate::session::safe_position(position);
+        let position = decoder.total_duration().map(|d| position.min(d.as_secs_f64())).unwrap_or(position);
+        if position > 0.0 {
+            guard_decoder(|| {
+                decoder
+                    .try_seek(Duration::from_secs_f64(crate::session::safe_position(position)))
+                    .map_err(|e| e.to_string())
+            })?;
+        }
         self.cancel_stream();
         self.output.clear();
-        self.output.append(decoder);
+        self.append_current(decoder, position);
         self.output.play();
         Ok(())
     }
 
     pub fn play_streaming(&self, progress: Arc<Progress>, path: &Path, total: Option<u64>) -> Result<(), String> {
+        if self.has_stream_error() {
+            return Err(crate::i18n::tr("аудиоустройство недоступно").into());
+        }
         let reader = GrowingReader::open(progress, path)?;
         let cancel = reader.cancel_handle();
         let startup = reader.startup_handle();
@@ -80,15 +106,18 @@ impl Player {
         self.output.clear();
         *crate::lock(&self.stream_cancel) = Some(cancel);
         *crate::lock(&self.stream_startup) = Some(startup);
-        self.output.append(decoder);
+        self.append_current(decoder, 0.0);
         self.output.play();
         Ok(())
     }
 
     pub fn stop(&self) {
+        self.clear_next();
         self.cancel_stream();
         self.output.stop();
-        self.output.clear();
+        if !self.has_stream_error() {
+            self.output.clear();
+        }
     }
 
     pub fn pause(&self) {
@@ -107,20 +136,25 @@ impl Player {
     }
 
     pub fn position(&self) -> f64 {
-        self.output.get_pos().as_secs_f64()
+        self.clock.position()
+    }
+    pub fn snapshot(&self) -> (u64, f64) {
+        self.clock.snapshot()
     }
 
     pub fn seek(&self, seconds: f64) -> Result<(), String> {
         // `try_seek` on a stream whose device is gone blocks forever, so a
         // failed stream must never reach it.
         if self.has_stream_error() {
-            return Err("аудиоустройство недоступно".into());
+            return Err(crate::i18n::tr("аудиоустройство недоступно").into());
         }
-        let target = seek_duration(seconds).ok_or_else(|| "некорректная позиция перемотки".to_string())?;
+        let target =
+            seek_duration(seconds).ok_or_else(|| crate::i18n::tr("некорректная позиция перемотки").to_string())?;
         // The decoder seeks on the audio thread, while rodio waits for its
         // reply here. Interrupt an existing network wait and prevent new ones.
         let _mode = NonblockingSeek::new(crate::lock(&self.stream_startup).clone());
-        self.output.try_seek(target).map_err(|e| format!("перемотка недоступна: {e}"))
+        self.clock.seek_token.store(self.token(), Ordering::Release);
+        self.output.try_seek(target).map_err(|e| crate::i18n::trf!("перемотка недоступна: {e}", e = e))
     }
 
     pub fn set_volume(&mut self, volume: f32) {
@@ -130,6 +164,58 @@ impl Player {
 
     pub fn volume(&self) -> f32 {
         self.volume
+    }
+
+    fn append_current(&self, source: crate::opus::AudioSource, position: f64) {
+        let channels = self._sink.config().channel_count();
+        let rate = self._sink.config().sample_rate();
+        let token = self.serial.fetch_add(1, Ordering::Relaxed);
+        self.clock.reset_at(token, position);
+        // Queue metadata in rodio can lag a source boundary. Normalise each
+        // track to the actual device format before queuing, so switching
+        // between mono/stereo and sample rates cannot corrupt the first span.
+        self.output.append(rodio::source::UniformSourceIterator::new(
+            crate::playback::Tracked::at(source, self.clock.clone(), token, position),
+            channels,
+            rate,
+        ));
+        self.append_future(channels, rate);
+    }
+
+    fn append_future(&self, channels: rodio::ChannelCount, rate: rodio::SampleRate) {
+        let slot = crate::playback::NextSlot::new(channels, rate);
+        self.output.append(crate::playback::FutureSource::new(slot.clone(), self.clock.clone()));
+        *crate::lock(&self.next) = Some(slot);
+    }
+
+    pub fn token(&self) -> u64 {
+        self.clock.token.load(Ordering::Acquire)
+    }
+
+    pub fn clear_next(&self) {
+        if let Some(slot) = crate::lock(&self.next).as_ref() {
+            slot.clear();
+        }
+    }
+
+    pub fn queue_prepared(&self, source: crate::opus::AudioSource) -> Option<u64> {
+        if self.has_stream_error() || self.ended() {
+            return None;
+        }
+        let token = self.serial.fetch_add(1, Ordering::Relaxed);
+        if crate::lock(&self.next).as_ref()?.set(token, source) {
+            Some(token)
+        } else {
+            None
+        }
+    }
+
+    /// The previous placeholder is now the current source; queue one new slot.
+    pub fn advance_slot(&self) {
+        self.cancel_stream();
+        if !self.has_stream_error() && !self.ended() {
+            self.append_future(self._sink.config().channel_count(), self._sink.config().sample_rate());
+        }
     }
 }
 
@@ -169,12 +255,12 @@ fn open_sink(flag: Arc<AtomicBool>) -> Result<MixerDeviceSink, String> {
             return Ok(silence_drop(sink));
         }
     }
-    Err("не найдено подходящее устройство вывода".into())
+    Err(crate::i18n::tr("не найдено подходящее устройство вывода").into())
 }
 
 fn flag_callback(flag: Arc<AtomicBool>) -> impl FnMut(rodio::cpal::StreamError) + Send + Clone + 'static {
     move |err: rodio::cpal::StreamError| {
-        eprintln!("beat: аудиопоток: {err}");
+        eprintln!("{}", crate::i18n::trf!("beat: аудиопоток: {err}", err = err));
         flag.store(true, Ordering::SeqCst);
     }
 }
@@ -209,9 +295,11 @@ fn seek_duration(seconds: f64) -> Option<Duration> {
 /// Decoder over a finished file on disk. The byte length is what makes rodio
 /// mark the source seekable: without it symphonia refuses every backward seek
 /// (slider, "previous track" restart) and mp3 has no total duration.
-fn open_file_decoder(path: &Path) -> Result<crate::opus::AudioSource, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("не удалось открыть {}: {e}", path.display()))?;
-    let len = file.metadata().map_err(|e| format!("не удалось прочитать {}: {e}", path.display()))?.len();
+pub(crate) fn open_file_decoder(path: &Path) -> Result<crate::opus::AudioSource, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| crate::i18n::trf!("не удалось открыть {}: {e}", path.display(), e = e))?;
+    let len =
+        file.metadata().map_err(|e| crate::i18n::trf!("не удалось прочитать {}: {e}", path.display(), e = e))?.len();
     open_decoder(std::io::BufReader::new(file), Some(len))
 }
 
@@ -231,29 +319,29 @@ fn decode_input<R: std::io::Read + std::io::Seek + Send + Sync + 'static>(
     len: Option<u64>,
     streaming: bool,
 ) -> Result<crate::opus::AudioSource, String> {
-    crate::media::validate_metadata(&mut reader).map_err(|e| format!("метаданные: {e}"))?;
+    crate::media::validate_metadata(&mut reader).map_err(|e| crate::i18n::trf!("метаданные: {e}", e = e))?;
     guard_decoder(|| {
         if crate::opus::container(&mut reader).map_err(|e| e.to_string())? {
             return crate::opus::decode(reader, len, streaming)
                 .map(|source| Box::new(source) as crate::opus::AudioSource)
                 .map_err(|e| format!("Opus: {e}"));
         }
-        let mut builder = Decoder::builder().with_data(reader);
+        let mut builder = Decoder::builder().with_data(reader).with_gapless(true);
         if let Some(len) = len {
             builder = builder.with_byte_len(len);
         }
         builder
             .build()
             .map(|decoder| Box::new(decoder) as crate::opus::AudioSource)
-            .map_err(|e| format!("декодер: {e}"))
+            .map_err(|e| crate::i18n::trf!("декодер: {e}", e = e))
     })
 }
 
 fn guard_decoder<T>(build: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    crate::HANDLED_PANIC.with(|handled| handled.set(true));
+    let old = crate::HANDLED_PANIC.with(|handled| handled.replace(true));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build));
-    crate::HANDLED_PANIC.with(|handled| handled.set(false));
-    result.unwrap_or_else(|_| Err("декодер не смог прочитать повреждённый файл".into()))
+    crate::HANDLED_PANIC.with(|handled| handled.set(old));
+    result.unwrap_or_else(|_| Err(crate::i18n::tr("декодер не смог прочитать повреждённый файл").into()))
 }
 
 #[cfg(test)]

@@ -11,17 +11,19 @@ fn read_state(path: &std::path::Path, cap: u64) -> Result<Option<String>, String
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("не удалось открыть {path:?}: {err}")),
+        Err(err) => return Err(crate::i18n::trf!("не удалось открыть {path:?}: {err}", err = err, path = path)),
     };
     if file.metadata().map_err(|e| e.to_string())?.len() > cap {
-        return Err(format!("файл {path:?} превышает лимит {} МБ", cap / 1024 / 1024));
+        return Err(crate::i18n::trf!("файл {path:?} превышает лимит {} МБ", cap / 1024 / 1024, path = path));
     }
     let mut bytes = Vec::new();
-    file.take(cap + 1).read_to_end(&mut bytes).map_err(|e| format!("не удалось прочитать {path:?}: {e}"))?;
+    file.take(cap + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| crate::i18n::trf!("не удалось прочитать {path:?}: {e}", e = e, path = path))?;
     if bytes.len() as u64 > cap {
-        return Err(format!("файл {path:?} превышает лимит {} МБ", cap / 1024 / 1024));
+        return Err(crate::i18n::trf!("файл {path:?} превышает лимит {} МБ", cap / 1024 / 1024, path = path));
     }
-    String::from_utf8(bytes).map(Some).map_err(|_| format!("файл {path:?} не в UTF-8"))
+    String::from_utf8(bytes).map(Some).map_err(|_| crate::i18n::trf!("файл {path:?} не в UTF-8", path = path))
 }
 
 pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
@@ -41,7 +43,7 @@ pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), S
     if created && result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
-    result.map_err(|e| format!("не удалось записать {path:?}: {e}"))
+    result.map_err(|e| crate::i18n::trf!("не удалось записать {path:?}: {e}", e = e, path = path))
 }
 
 /// A corrupt file is set aside so the user can recover instead of having it
@@ -78,29 +80,29 @@ fn protect_secret(secret: &str) -> Result<String, String> {
 /// it again after a restart; every other setting still persists.
 #[cfg(not(windows))]
 fn protect_secret(_secret: &str) -> Result<String, String> {
-    Err("на этой платформе пароль нельзя сохранить безопасно".into())
+    Err(crate::i18n::tr("на этой платформе пароль нельзя сохранить безопасно").into())
 }
 
 #[cfg(windows)]
 fn unprotect_secret(stored: &str) -> Result<String, String> {
-    let hex = stored.strip_prefix("dpapi:v1:").ok_or("неизвестный формат пароля")?;
+    let hex = stored.strip_prefix("dpapi:v1:").ok_or(crate::i18n::tr("неизвестный формат пароля"))?;
     if hex.len() % 2 != 0 || !hex.is_ascii() {
-        return Err("повреждённый пароль".into());
+        return Err(crate::i18n::tr("повреждённый пароль").into());
     }
     let bytes = hex
         .as_bytes()
         .chunks_exact(2)
         .map(|pair| {
-            let pair = std::str::from_utf8(pair).map_err(|_| "повреждённый пароль".to_string())?;
-            u8::from_str_radix(pair, 16).map_err(|_| "повреждённый пароль".to_string())
+            let pair = std::str::from_utf8(pair).map_err(|_| crate::i18n::tr("повреждённый пароль").to_string())?;
+            u8::from_str_radix(pair, 16).map_err(|_| crate::i18n::tr("повреждённый пароль").to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    String::from_utf8(dpapi(&bytes, false)?).map_err(|_| "повреждённый пароль".into())
+    String::from_utf8(dpapi(&bytes, false)?).map_err(|_| crate::i18n::tr("повреждённый пароль").into())
 }
 
 #[cfg(not(windows))]
 fn unprotect_secret(_stored: &str) -> Result<String, String> {
-    Err("пароль сохранён для Windows и не может быть прочитан на этой системе".into())
+    Err(crate::i18n::tr("пароль сохранён для Windows и не может быть прочитан на этой системе").into())
 }
 
 #[cfg(windows)]
@@ -136,7 +138,7 @@ fn dpapi(input: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
     unsafe extern "system" {
         fn LocalFree(memory: *mut c_void) -> *mut c_void;
     }
-    let size = u32::try_from(input.len()).map_err(|_| "пароль слишком длинный".to_string())?;
+    let size = u32::try_from(input.len()).map_err(|_| crate::i18n::tr("пароль слишком длинный").to_string())?;
     let source = DataBlob { size, data: input.as_ptr() as *mut u8 };
     let mut output = DataBlob { size: 0, data: std::ptr::null_mut() };
     // DPAPI is scoped to the current Windows user. UI prompts are disabled.
@@ -164,10 +166,10 @@ fn dpapi(input: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
         }
     };
     if ok == 0 {
-        return Err(format!("защита пароля Windows: {}", std::io::Error::last_os_error()));
+        return Err(crate::i18n::trf!("защита пароля Windows: {}", std::io::Error::last_os_error()));
     }
     if output.data.is_null() && output.size != 0 {
-        return Err("повреждённый ответ Windows DPAPI".into());
+        return Err(crate::i18n::tr("повреждённый ответ Windows DPAPI").into());
     }
     let bytes = if output.size == 0 {
         Vec::new()
@@ -194,8 +196,8 @@ pub enum StreamFormat {
 impl StreamFormat {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Raw => "оригинал",
-            Self::Mp3 => "mp3 (транскод)",
+            Self::Raw => crate::i18n::tr("оригинал"),
+            Self::Mp3 => crate::i18n::tr("mp3 (транскод)"),
         }
     }
 }
@@ -227,6 +229,11 @@ pub struct Config {
     /// here too. Empty = the system Music folder + `BEAT`.
     #[serde(default)]
     pub cache_dir: String,
+    /// Additional read-only local music roots. Cache deletion never uses them.
+    #[serde(default)]
+    pub library_dirs: Vec<String>,
+    #[serde(default)]
+    pub language: crate::i18n::Language,
     #[serde(default = "default_format")]
     pub stream_format: StreamFormat,
     /// Cap for mp3 transcoding, kbps (0 = server default).
@@ -270,6 +277,8 @@ impl Default for Config {
             user: String::new(),
             password: String::new(),
             cache_dir: String::new(),
+            library_dirs: Vec::new(),
+            language: crate::i18n::Language::En,
             stream_format: StreamFormat::Raw,
             bit_rate: 320,
             parallel_downloads: 3,
@@ -293,6 +302,14 @@ impl Config {
         self.bit_rate = self.bit_rate.min(320);
         truncate_chars(&mut self.server_url, 500);
         truncate_chars(&mut self.cache_dir, 500);
+        self.library_dirs.truncate(16);
+        for dir in &mut self.library_dirs {
+            *dir = dir.trim().to_owned();
+            truncate_chars(dir, 500);
+        }
+        self.library_dirs.retain(|dir| !dir.is_empty() && std::path::Path::new(dir).is_absolute());
+        let mut seen = std::collections::HashSet::new();
+        self.library_dirs.retain(|dir| seen.insert(crate::local::path_key(std::path::Path::new(dir))));
     }
 
     pub fn cache_root(&self) -> PathBuf {
@@ -301,6 +318,10 @@ impl Config {
         } else {
             PathBuf::from(self.cache_dir.trim())
         }
+    }
+
+    pub fn local_roots(&self) -> Vec<PathBuf> {
+        self.library_dirs.iter().map(PathBuf::from).collect()
     }
 
     pub fn load() -> Self {
@@ -312,8 +333,8 @@ impl Config {
                     let backup = backup_corrupt(&path);
                     Config {
                         warning: Some(match &backup {
-                            Some(name) => format!("config.json повреждён — загружены значения по умолчанию; старый файл сохранён как {name}"),
-                            None => "config.json повреждён; резервная копия не создана, сохранение заблокировано".into(),
+                            Some(name) => crate::i18n::trf!("config.json повреждён — загружены значения по умолчанию; старый файл сохранён как {name}", name = name),
+                            None => crate::i18n::tr("config.json повреждён; резервная копия не создана, сохранение заблокировано").into(),
                         }),
                         save_blocked: backup.is_none(),
                         ..Config::default()
@@ -322,7 +343,7 @@ impl Config {
             },
             Ok(None) => Config::default(),
             Err(err) => Config {
-                warning: Some(format!("{err}; сохранение заблокировано")),
+                warning: Some(crate::i18n::trf!("{err}; сохранение заблокировано", err = err)),
                 save_blocked: true,
                 ..Config::default()
             },
@@ -336,15 +357,17 @@ impl Config {
                 Err(_) => {
                     cfg.unreadable_password = Some(cfg.password.clone());
                     cfg.password.clear();
-                    cfg.warning =
-                        Some("пароль сервера не удалось расшифровать; введите его заново в настройках".into());
+                    cfg.warning = Some(
+                        crate::i18n::tr("пароль сервера не удалось расшифровать; введите его заново в настройках")
+                            .into(),
+                    );
                 }
             }
         }
         #[cfg(windows)]
         if had_plaintext {
             if let Err(err) = cfg.save() {
-                cfg.warning = Some(format!("не удалось защитить сохранённый пароль: {err}"));
+                cfg.warning = Some(crate::i18n::trf!("не удалось защитить сохранённый пароль: {err}", err = err));
             }
         }
         cfg
@@ -364,10 +387,14 @@ impl Config {
         protect: fn(&str) -> Result<String, String>,
     ) -> Result<(), String> {
         if self.save_blocked {
-            return Err("config.json не был прочитан; сохранение заблокировано во избежание потери данных".into());
+            return Err(crate::i18n::tr(
+                "config.json не был прочитан; сохранение заблокировано во избежание потери данных",
+            )
+            .into());
         }
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("не удалось создать {dir:?}: {e}"))?;
+            std::fs::create_dir_all(dir)
+                .map_err(|e| crate::i18n::trf!("не удалось создать {dir:?}: {e}", dir = dir, e = e))?;
         }
         self.warning = None;
         let mut disk = self.clone();
@@ -377,11 +404,14 @@ impl Config {
             match protect(&self.password) {
                 Ok(stored) => stored,
                 Err(err) => {
-                    self.warning = Some(format!("пароль не сохранён: {err}"));
+                    self.warning = Some(crate::i18n::trf!("пароль не сохранён: {err}", err = err));
                     // On the supported platform a temporary DPAPI failure must
                     // not replace the previous settings with an empty password.
                     #[cfg(windows)]
-                    return Err(format!("не удалось защитить пароль; настройки не изменены: {err}"));
+                    return Err(crate::i18n::trf!(
+                        "не удалось защитить пароль; настройки не изменены: {err}",
+                        err = err
+                    ));
                     #[cfg(not(windows))]
                     String::new()
                 }
@@ -389,7 +419,7 @@ impl Config {
         };
         let raw = serde_json::to_vec_pretty(&disk).map_err(|e| e.to_string())?;
         if raw.len() as u64 > MAX_CONFIG_BYTES {
-            return Err("config.json слишком большой".into());
+            return Err(crate::i18n::tr("config.json слишком большой").into());
         }
         atomic_write(path, &raw)
     }
@@ -458,6 +488,28 @@ pub fn music_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn music_roots_are_bounded_absolute_and_deduplicated_and_language_persists() {
+        let mut config = Config {
+            library_dirs: vec!["relative".into(), " ".into()],
+            language: crate::i18n::Language::Ru,
+            ..Default::default()
+        };
+        let first = std::env::temp_dir().join("beat-library-test").to_string_lossy().into_owned();
+        config.library_dirs.extend([first.clone(), first.clone()]);
+        config.sanitize();
+        assert_eq!(config.library_dirs, vec![first]);
+        assert_eq!(config.local_roots().len(), 1);
+        for i in 0..40 {
+            config.library_dirs.push(std::env::temp_dir().join(format!("music-{i}")).to_string_lossy().into_owned());
+        }
+        config.sanitize();
+        assert_eq!(config.local_roots().len(), 16);
+        let back: Config = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(back.language, crate::i18n::Language::Ru);
+        assert_eq!(back.library_dirs, config.library_dirs);
+    }
 
     #[test]
     fn config_roundtrips_with_defaults_for_missing_fields() {

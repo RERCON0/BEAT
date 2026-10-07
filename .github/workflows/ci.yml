@@ -31,6 +31,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check local documentation links
         run: python -B scripts/check_docs.py
+      - name: Check built-in translations and format placeholders
+        run: python -B scripts/update_i18n.py --check
 
   windows:
     name: Windows x64 tests and optimized build

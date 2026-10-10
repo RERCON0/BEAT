@@ -49,9 +49,32 @@ impl BeatApp {
         }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            let width = (ui.available_width() - 70.0).max(140.0);
+            let filtering = !self.library_filter.is_empty();
+            let summary = filtering.then(|| {
+                let (found, total) = (self.library_filtered.len(), self.library_rows.len());
+                crate::i18n::trf!("найдено {found} из {total}", found = found, total = total)
+            });
+            // Measure the trailing widgets instead of reserving a flat width: a
+            // flat 70pt left «найдено N из M» hanging past the panel edge. The
+            // summary gives way first, so field, clear button and summary always
+            // fit the row.
+            let font = egui::FontId::new(10.0, egui::FontFamily::Proportional);
+            let spacing = ui.spacing().item_spacing.x;
+            let button = ui.spacing().interact_size.x;
+            let row = ui.available_width();
+            let budget = if filtering { (row - 60.0 - button - 2.0 * spacing).max(0.0) } else { 0.0 };
+            let label_slot = summary
+                .as_ref()
+                .map(|text| {
+                    ui.fonts_mut(|fonts| {
+                        fonts.layout_no_wrap(text.clone(), font.clone(), egui::Color32::WHITE).rect.width()
+                    })
+                    .min(budget)
+                })
+                .unwrap_or(0.0);
+            let trailing = if filtering { label_slot + button + 2.0 * spacing } else { 0.0 };
             let field = ui.add_sized(
-                [width, 26.0],
+                [(row - trailing).max(60.0), 26.0],
                 egui::TextEdit::singleline(&mut self.library_filter)
                     .font(theme::field_font())
                     .hint_text(crate::i18n::tr("фильтр: название, артист или альбом…")),
@@ -59,16 +82,15 @@ impl BeatApp {
             if field.changed() {
                 self.rebuild_library_filter();
             }
-            if !self.library_filter.is_empty() {
+            if filtering {
                 if ui.button("×").on_hover_text(crate::i18n::tr("сбросить фильтр")).clicked() {
                     self.library_filter.clear();
                     self.rebuild_library_filter();
                 }
-                let (found, total) = (self.library_filtered.len(), self.library_rows.len());
-                ui.label(
-                    egui::RichText::new(crate::i18n::trf!("найдено {found} из {total}", found = found, total = total))
-                        .size(10.0)
-                        .color(theme::faint()),
+                let text = clip_to_width(ui, summary.as_deref().unwrap_or_default(), font, label_slot);
+                ui.add_sized(
+                    [label_slot, 18.0],
+                    egui::Label::new(egui::RichText::new(text).size(10.0).color(theme::faint())).truncate(),
                 );
             }
         });

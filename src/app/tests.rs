@@ -682,3 +682,53 @@ fn both_settings_messages_wrap_above_the_button_row() {
     // Both messages stack above each other, not on one row.
     assert!(note.min.y >= rect_of(error).max.y, "the two messages share a row");
 }
+
+/// The library filter row reserved a flat 70 points for the clear button *and*
+/// the «найдено N из M» summary, so the summary ran past the panel edge and was
+/// cut off by the window. The trailing widgets are measured now; this checks the
+/// whole row stays inside the panel at any width.
+#[test]
+fn the_library_filter_row_keeps_its_summary_inside_the_panel() {
+    // 734 is the narrowest panel the app can reach: a 1000pt window minus the
+    // fixed 238pt sidebar and the 14pt CentralPanel margin on each side.
+    for width in [1400.0_f32, 1000.0, 860.0, 734.0] {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, true);
+        let mut app = BeatApp::preview(&ctx);
+        // The demo snapshot has no library rows, so give the filter real counts.
+        app.library_filter = "ge".into();
+        app.rebuild_library_filter();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 700.0))),
+                ..Default::default()
+            },
+            |ui| {
+                ui.set_width(width);
+                app.ui_library(ui);
+            },
+        );
+        output.textures_delta.clear();
+        // A point of slack for the painter's own rounding.
+        let limit = width + 1.0;
+        let escaped: Vec<(String, egui::Rect)> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.visual_bounding_rect().right() > limit => {
+                    Some((text.galley.text().to_owned(), text.visual_bounding_rect()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(escaped.is_empty(), "width {width}: text drawn past the panel: {escaped:?}");
+        // The summary has to survive, not be clipped out of existence.
+        let summary = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text().starts_with("найдено") => {
+                Some(text.galley.text().to_owned())
+            }
+            _ => None,
+        });
+        assert!(summary.is_some(), "width {width}: the summary disappeared");
+    }
+}

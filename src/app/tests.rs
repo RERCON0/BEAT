@@ -580,3 +580,105 @@ fn clicking_download_album_collects_a_command_without_starting_work_while_drawin
     assert!(app.commands.is_empty(), "preview left a command pending");
     assert!(app.pending_download.is_none(), "preview launched a real request");
 }
+
+/// The reported layout bug: the connection error was drawn inside the button
+/// row, so a sentence-long message ran under the save and cancel buttons that
+/// the right-aligned block placed on top of it. It now wraps on its own rows
+/// above the buttons.
+///
+/// The footer is rendered directly rather than through the settings window:
+/// a headless pass sizes a window from the first frame it ever sees, which
+/// clips the modal and would hide the very rows under test.
+#[test]
+fn a_long_settings_error_never_overlaps_the_settings_buttons() {
+    let error = "адрес сервера должен быть HTTPS (HTTP допустим только для localhost и адресов локальной сети) \
+                  и без логина, параметров или фрагмента";
+    // The width the settings window gives its content, and a narrower one.
+    for width in [620.0_f32, 420.0] {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, true);
+        let failed = Err(error.to_owned());
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 900.0))),
+                ..Default::default()
+            },
+            |ui| {
+                ui.set_width(width);
+                settings_footer(ui, false, Some(&failed), None);
+            },
+        );
+        output.textures_delta.clear();
+        let texts: Vec<(String, egui::Rect, usize)> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => {
+                    Some((text.galley.text().to_owned(), text.visual_bounding_rect(), text.galley.rows.len()))
+                }
+                _ => None,
+            })
+            .collect();
+        let (error_rect, rows) = texts
+            .iter()
+            .find(|(text, _, _)| text == error)
+            .map(|(_, rect, rows)| (*rect, *rows))
+            .unwrap_or_else(|| panic!("width {width}: the error was not rendered"));
+        // A sentence this long cannot fit on one row of the settings window.
+        assert!(rows > 1, "width {width}: the error did not wrap: {error_rect:?}");
+        for button in ["[ ПРОВЕРИТЬ СВЯЗЬ ]", "[ СОХРАНИТЬ ]", "[ ОТМЕНА ]"] {
+            let rect = texts
+                .iter()
+                .find(|(text, _, _)| text == button)
+                .map(|(_, rect, _)| *rect)
+                .unwrap_or_else(|| panic!("width {width}: {button} was not rendered"));
+            assert!(
+                error_rect.max.y <= rect.min.y,
+                "width {width}: {button} at {rect:?} sits on the error at {error_rect:?}"
+            );
+        }
+    }
+}
+
+/// The same footer with a saved-but-refused config, which reports its own
+/// second error next to the connection result.
+#[test]
+fn both_settings_messages_wrap_above_the_button_row() {
+    let error = "соединение закрыто: ошибка ввода-вывода";
+    let save_error = "дождитесь окончания загрузок перед сменой сервера, формата или папки кеша";
+    let ctx = egui::Context::default();
+    theme::apply(&ctx, true);
+    let failed = Err(error.to_owned());
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(620.0, 900.0))),
+            ..Default::default()
+        },
+        |ui| {
+            ui.set_width(620.0);
+            settings_footer(ui, false, Some(&failed), Some(save_error));
+        },
+    );
+    output.textures_delta.clear();
+    let texts: Vec<(String, egui::Rect)> = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some((text.galley.text().to_owned(), text.visual_bounding_rect())),
+            _ => None,
+        })
+        .collect();
+    let rect_of = |want: &str| {
+        texts
+            .iter()
+            .find(|(text, _)| text == want)
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| panic!("{want} was not rendered"))
+    };
+    let save = rect_of("[ СОХРАНИТЬ ]");
+    assert!(rect_of(error).max.y <= save.min.y, "the connection error reaches into the buttons: {save:?}");
+    let note = rect_of(&format!("конфиг не сохранён: {save_error}"));
+    assert!(note.max.y <= save.min.y, "the save error reaches into the buttons: {save:?}");
+    // Both messages stack above each other, not on one row.
+    assert!(note.min.y >= rect_of(error).max.y, "the two messages share a row");
+}

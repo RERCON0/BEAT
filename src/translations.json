@@ -18,7 +18,7 @@
   "сервер перенаправляет на другой адрес; укажите в настройках итоговый адрес сервера": "server redirects to another origin; enter the final server URL in settings",
   "некорректный адрес сервера": "invalid server URL",
   "адрес сервера без хоста": "server URL has no host",
-  "адрес сервера должен быть HTTPS (HTTP допустим только для localhost) и без логина, параметров или фрагмента": "server URL must use HTTPS (HTTP is allowed only for localhost), without credentials, query or fragment",
+  "адрес сервера должен быть HTTPS (HTTP допустим только для localhost и адресов локальной сети) и без логина, параметров или фрагмента": "server URL must use HTTPS (HTTP is allowed only for localhost and LAN addresses), without credentials, query or fragment",
   "не удалось прочитать ответ сервера: {e}": "could not read the server response: {e}",
   "ответ сервера слишком большой": "server response is too large",
   "сеть: сервер не отвечает; проверьте адрес и соединение": "network: server is not responding; check its URL and your connection",

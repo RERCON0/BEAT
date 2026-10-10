@@ -49,6 +49,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use ui_common::*;
+// The layout tests render the settings footer directly.
+#[cfg(test)]
+use ui_settings::settings_footer;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 

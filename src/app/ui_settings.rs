@@ -1,5 +1,62 @@
 use super::*;
 
+/// What the settings footer asks the caller to do.
+pub(super) enum FooterAction {
+    Check,
+    Save,
+    Cancel,
+}
+
+/// The settings messages and the button row under them.
+///
+/// A server error is a full sentence and can be long, so it gets its own
+/// wrapped row. Inside the button row it ran under the buttons drawn after it.
+pub(super) fn settings_footer(
+    ui: &mut egui::Ui,
+    checking: bool,
+    check_result: Option<&Result<(), String>>,
+    save_error: Option<&str>,
+) -> Option<FooterAction> {
+    ui.add_space(8.0);
+    if let Some(result) = check_result {
+        let (text, color) = match result {
+            Ok(()) => (crate::i18n::tr("связь есть").into(), theme::accent()),
+            Err(err) => (err.clone(), theme::err()),
+        };
+        ui.add(egui::Label::new(egui::RichText::new(text).size(11.0).color(color)).wrap());
+    }
+    if let Some(err) = save_error {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(crate::i18n::trf!("конфиг не сохранён: {err}", err = err))
+                    .size(10.0)
+                    .color(theme::err()),
+            )
+            .wrap(),
+        );
+    }
+    ui.horizontal(|ui| {
+        if ui.add_enabled(!checking, egui::Button::new(crate::i18n::tr("[ ПРОВЕРИТЬ СВЯЗЬ ]"))).clicked()
+        {
+            return Some(FooterAction::Check);
+        }
+        if checking {
+            ui.label(egui::RichText::new(crate::i18n::tr("проверяю…")).size(11.0).color(theme::faint()));
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.add(theme::accent_button(crate::i18n::tr("[ СОХРАНИТЬ ]"))).clicked() {
+                return Some(FooterAction::Save);
+            }
+            if ui.add(egui::Button::new(crate::i18n::tr("[ ОТМЕНА ]"))).clicked() {
+                return Some(FooterAction::Cancel);
+            }
+            None
+        })
+        .inner
+    })
+    .inner
+}
+
 impl BeatApp {
     pub(super) fn ui_settings_modal(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
@@ -88,28 +145,12 @@ impl BeatApp {
                     ui.checkbox(&mut draft.auto_cache_new, crate::i18n::tr("автоматически кешировать новые песни"));
                     ui.label(egui::RichText::new(crate::i18n::tr("При первом включении запоминает текущие треки; затем проверяет сервер каждые 10 минут, пока BEAT открыт."))
                         .size(10.0).color(theme::dim()));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(!checking, egui::Button::new(crate::i18n::tr("[ ПРОВЕРИТЬ СВЯЗЬ ]"))).clicked() {
-                            check = true;
-                        }
-                        if checking {
-                            ui.label(egui::RichText::new(crate::i18n::tr("проверяю…")).size(11.0).color(theme::faint()));
-                        } else if let Some(result) = &check_result {
-                            let (text, color) = match result {
-                                Ok(()) => (crate::i18n::tr("связь есть").into(), theme::accent()),
-                                Err(err) => (err.clone(), theme::err()),
-                            };
-                            ui.label(egui::RichText::new(text).size(11.0).color(color));
-                        }
-                        if let Some(err) = &save_error {
-                            ui.label(egui::RichText::new(crate::i18n::trf!("конфиг не сохранён: {err}", err = err)).size(10.0).color(theme::err()));
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(theme::accent_button(crate::i18n::tr("[ СОХРАНИТЬ ]"))).clicked() { save = true; }
-                            if ui.add(egui::Button::new(crate::i18n::tr("[ ОТМЕНА ]"))).clicked() { cancel = true; }
-                        });
-                    });
+                    match settings_footer(ui, checking, check_result.as_ref(), save_error.as_deref()) {
+                        Some(FooterAction::Check) => check = true,
+                        Some(FooterAction::Save) => save = true,
+                        Some(FooterAction::Cancel) => cancel = true,
+                        None => {}
+                    }
                 });
         }
         if pick_dir {

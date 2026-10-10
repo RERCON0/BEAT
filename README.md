@@ -68,8 +68,12 @@ is signed with Ed25519; see [verification and the publisher key](docs/RELEASING.
 3. Open the library, an album or search. **▶** plays; **↓** downloads.
 
 The address may include a subfolder, such as `https://music.example.com/library`;
-do not append `/rest`. Remote servers require HTTPS; HTTP is allowed only for
-`localhost` and loopback addresses.
+do not append `/rest`. Servers reachable from the internet require HTTPS. Plain
+HTTP is accepted for addresses that stay inside the local network:
+`localhost`, loopback, private and link-local addresses (`192.168.x.x`,
+`10.x.x.x`, `172.16–31.x.x`, `169.254.x.x`, `100.64–127.x.x`, `fd…`/`fe80…`),
+and names such as `navidrome` or `navidrome.local`. Token and password travel
+in the query string, so keep a LAN server on a trusted network.
 
 > [!TIP]
 > Automatic caching first remembers the existing songs, then downloads new

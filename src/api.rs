@@ -333,22 +333,58 @@ fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
     a.scheme() == b.scheme() && a.host_str() == b.host_str() && a.port_or_known_default() == b.port_or_known_default()
 }
 
-/// Same rule as the rest of the family: HTTPS only, HTTP just for localhost.
+/// Same rule as the rest of the family: HTTPS for anything routable, plain
+/// HTTP only where the request cannot leave the local network. Navidrome
+/// servers usually sit on a home LAN and are rarely exposed to the internet,
+/// so private and link-local addresses stay usable without HTTPS.
 fn checked_base_url(raw: &str) -> Result<String, String> {
     let url = reqwest::Url::parse(raw.trim()).map_err(|_| crate::i18n::tr("некорректный адрес сервера").to_string())?;
     let host = url.host_str().ok_or(crate::i18n::tr("адрес сервера без хоста"))?;
-    // IPv6 hosts come back in brackets: `[::1]`.
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    let local = host == "localhost" || bare.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
-    if (url.scheme() != "https" && !(url.scheme() == "http" && local))
+    if (url.scheme() != "https" && !(url.scheme() == "http" && plain_http_allowed(host)))
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err(crate::i18n::tr("адрес сервера должен быть HTTPS (HTTP допустим только для localhost) и без логина, параметров или фрагмента").into());
+        return Err(crate::i18n::tr("адрес сервера должен быть HTTPS (HTTP допустим только для localhost и адресов локальной сети) и без логина, параметров или фрагмента").into());
     }
     Ok(url.as_str().trim_end_matches('/').to_owned())
+}
+
+/// Whether a plain-HTTP server address stays inside the local network.
+///
+/// Accepts loopback plus the ranges a home router hands out and a NAS or
+/// self-hosted box keeps: RFC 1918 private space, RFC 6598 carrier-grade NAT
+/// (also the range Tailscale uses), link-local addresses and IPv6 unique-local
+/// space. A name is judged only by its shape, never resolved: a single label or
+/// a `.local`/`.lan`/`.home`/`.internal` suffix is what mDNS and a router's own
+/// DNS answer, while any dotted public name still requires HTTPS. Public IPv4
+/// and public IPv6 stay rejected, so an internet-facing server is never
+/// contacted in the clear.
+fn plain_http_allowed(host: &str) -> bool {
+    // IPv6 hosts come back in brackets: `[::1]`.
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                let [a, b, ..] = v4.octets();
+                v4.is_loopback() || v4.is_private() || v4.is_link_local() || (a == 100 && (b & 0xc0) == 64)
+            }
+            // fc00::/7 unique-local, fe80::/10 link-local.
+            std::net::IpAddr::V6(v6) => {
+                let head = v6.segments()[0];
+                v6.is_loopback() || (head & 0xfe00) == 0xfc00 || (head & 0xffc0) == 0xfe80
+            }
+        };
+    }
+    // A single label and a trailing root dot both mean the same thing here.
+    let name = host.trim_end_matches('.').to_ascii_lowercase();
+    if name == "localhost" || !name.contains('.') {
+        return true;
+    }
+    [".local", ".lan", ".home", ".home.arpa", ".internal", ".localdomain", ".intranet"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
 }
 
 /// 128 random bits as hex. `RandomState` is keyed from the OS random
@@ -835,10 +871,49 @@ mod tests {
     }
 
     #[test]
+    fn lan_addresses_reach_a_plain_http_server_without_https() {
+        // The reported case: Navidrome on the home network over plain HTTP.
+        assert_eq!(checked_base_url("http://192.168.1.100:4533").unwrap(), "http://192.168.1.100:4533");
+        for base in [
+            "http://10.0.0.5:4533",
+            "http://172.16.3.4:4533",
+            "http://192.168.0.9/",
+            "http://169.254.10.10:4533",
+            "http://100.101.102.103:4533",
+            "http://[fe80::1]:4533",
+            "http://[fd12:3456:789a::1]:4533",
+            "http://navidrome:4533",
+            "http://navidrome.local:4533",
+            "http://music.LAN:4533",
+            "http://box.home.arpa:4533",
+        ] {
+            assert!(checked_base_url(base).is_ok(), "{base}");
+        }
+    }
+
+    #[test]
+    fn public_addresses_and_public_names_still_need_https() {
+        for base in [
+            "http://music.example.com",
+            "http://8.8.8.8:4533",
+            "http://[2001:db8::1]:4533",
+            "http://172.32.0.1:4533",
+            "http://navidrome.example.org",
+            "http://example.localhost.example.com",
+        ] {
+            assert!(checked_base_url(base).is_err(), "{base}");
+        }
+        // The same hosts stay reachable over HTTPS.
+        for base in ["https://music.example.com", "https://8.8.8.8:4533", "https://[2001:db8::1]:4533"] {
+            assert!(checked_base_url(base).is_ok(), "{base}");
+        }
+    }
+
+    #[test]
     fn ipv6_loopback_is_local_over_http_but_other_addresses_are_not() {
         assert_eq!(checked_base_url("http://[::1]:4533/").unwrap(), "http://[::1]:4533");
         assert!(checked_base_url("http://[2001:db8::1]:4533").is_err());
-        assert!(checked_base_url("http://192.168.1.5:4533").is_err());
+        assert_eq!(checked_base_url("http://192.168.1.5:4533").unwrap(), "http://192.168.1.5:4533");
         assert!(checked_base_url("https://[2001:db8::1]:4533").is_ok());
     }
 
@@ -949,7 +1024,10 @@ mod tests {
         for (body, must_fail) in scenarios {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let base = format!("http://{}/", listener.local_addr().unwrap());
-            let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
             let server = serve(listener, 1, move |_| reply.clone());
             let client =
                 Client::new(&Server { base, user: "u".into(), password: "p".into() }, StreamFormat::Raw, 320).unwrap();
@@ -1037,7 +1115,10 @@ mod tests {
 
     fn ok_json() -> String {
         let body = r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#;
-        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
     }
 
     #[test]
@@ -1068,7 +1149,9 @@ mod tests {
         let server = serve(first, 1, move |line| {
             let query =
                 line.split_once('?').map(|(_, rest)| rest.split(' ').next().unwrap_or_default()).unwrap_or_default();
-            format!("HTTP/1.1 302 Found\r\nLocation: http://{other_addr}/rest/ping.view?{query}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{other_addr}/rest/ping.view?{query}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
         });
         let client =
             Client::new(&Server { base, user: "u".into(), password: "hunter2".into() }, StreamFormat::Raw, 320)

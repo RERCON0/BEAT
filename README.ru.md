@@ -8,6 +8,7 @@
 <a href="https://github.com/RERCON0/BEAT/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/RERCON0/BEAT/actions/workflows/ci.yml/badge.svg?branch=main"></a>
 <a href="https://github.com/RERCON0/BEAT/actions/workflows/security.yml"><img alt="Security" src="https://github.com/RERCON0/BEAT/actions/workflows/security.yml/badge.svg?branch=main"></a>
 <a href="#сборка"><img alt="Windows x64" src="https://img.shields.io/badge/Windows-x64-0078D4?logo=windows&logoColor=white"></a>
+<a href="https://github.com/RERCON0/BEAT/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/RERCON0/BEAT/total?color=49b675"></a>
 <a href="LICENSE"><img alt="License: GPL v3 or later" src="https://img.shields.io/github/license/RERCON0/BEAT"></a>
 <a href="https://t.me/rercon"><img alt="Telegram" src="https://img.shields.io/badge/Telegram-@rercon-26A5E4?logo=telegram&logoColor=white"></a>
 </p>

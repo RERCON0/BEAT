@@ -2,6 +2,10 @@
 use super::*;
 
 impl eframe::App for BeatApp {
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.demo.is_some() {
             return;

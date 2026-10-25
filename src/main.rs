@@ -80,7 +80,8 @@ fn main() -> eframe::Result {
     if demo.is_some() {
         viewport = viewport.with_inner_size([1280.0, 800.0]).with_resizable(false);
     }
-    let options = eframe::NativeOptions { viewport, centered: true, ..Default::default() };
+    let options =
+        eframe::NativeOptions { viewport, centered: true, persist_window: demo.is_none(), ..Default::default() };
     let result = eframe::run_native("BEAT", options, Box::new(move |cc| Ok(Box::new(BeatApp::new(cc, demo)))));
     if let Err(e) = &result {
         fatal_dialog(

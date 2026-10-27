@@ -23,7 +23,7 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 # Playback: rodio + symphonia decode mp3/flac/ogg/wav/m4a; the "play from the
 # growing cache file" reader lives in player.rs. default-features off drops the
 # recording stack; playback is required for the output device.
-rodio = { version = "0.22", default-features = false, features = ["playback", "mp3", "flac", "vorbis", "wav", "mp4"] }
+rodio = { version = "0.23", default-features = false, features = ["playback", "mp3", "flac", "vorbis", "wav", "mp4"] }
 # Tag/duration probe for local files (title, artist, album). Only reading is
 # done here; playback stays in rodio. Format features mirror rodio's above.
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "ogg", "vorbis", "wav", "isomp4", "mkv"] }
